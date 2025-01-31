@@ -7,7 +7,7 @@ import asyncio
 from surrortg.devices.tcp import TcpCar, TcpCommandId, TcpActuator
 
 class Skidsteer(TcpCar):
-    """Class for TCP-controlled M5 Rover"""
+    """Class for TCP-controlled converted Double Eagle E594 """
 
     def __init__(
         self,
@@ -38,23 +38,21 @@ class Skidsteer(TcpCar):
             bot_listener_cb=self._handle_battery_response
         )
 
-    async def _handle_battery_response(self, seat, cmd_id, value):
-        """Process battery status updates"""
+    async def _handle_battery_response(self, seat, cmd_id, data):
         if cmd_id == TcpCommandId.BATTERY_STATUS:
-            self.battery_voltage, self.battery_soc = value
-            logging.info(f"Battery Status - Seat {seat}: {self.battery_soc}% SOC, {self.battery_voltage:.2f}V")
+            voltage, soc = data
+            logging.info(f"Battery seat {seat}: {voltage:.2f}V, {soc:.1f}%")
+            self.battery_voltage, self.battery_soc = voltage, soc
 
     async def request_battery_status(self, seat):
+        """Send battery status request without reading."""
         endpoint = self.endpoints.get(seat)
-        if endpoint and not endpoint.closed:
-            try:
-                # Send command + dummy value
-                await endpoint.send(struct.pack("BB", TcpCommandId.BATTERY_STATUS, 0))
-                
-                # Read and discard leftover bytes
-                while True:
-                    data = await endpoint.receive(100)
-                    if not data:
-                        break
-            except Exception as e:
-                logging.error(f"Battery protocol error: {e}")
+        if not endpoint or endpoint.closed:
+            logging.warning(f"Endpoint missing or closed for seat {seat}")
+            return
+        try:
+            cmd_bytes = struct.pack("BB", TcpCommandId.BATTERY_STATUS,0)
+            logging.info(f"Sending BATTERY_STATUS request: {cmd_bytes.hex()} to seat {seat}")
+            await endpoint.send(cmd_bytes)
+        except Exception as e:
+            logging.error(f"Battery request to seat {seat} failed: {e}")

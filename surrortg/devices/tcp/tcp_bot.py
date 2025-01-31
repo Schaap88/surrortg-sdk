@@ -214,20 +214,24 @@ class TcpBot:
         """Handles BATTERY_STATUS (9 bytes) and other commands (2 bytes)"""
         endpoint = self.endpoints[seat]
         try:
-            while True:
-                # Read COMMAND ID (1 byte)
-                cmd_id = await endpoint.receive_exactly(1)
-                cmd_id = struct.unpack("B", cmd_id)[0]
+                while True:
+                    # Read the command id (1 byte)
+                    cmd_id_raw = await endpoint.receive_exactly(1)
+                    cmd_id = struct.unpack("B", cmd_id_raw)[0]
 
-                # Handle BATTERY_STATUS response (8 bytes: 2 floats)
-                if cmd_id == TcpCommandId.BATTERY_STATUS:
-                    response = await endpoint.receive_exactly(8)
-                    voltage, soc = struct.unpack("<ff", response)  # Little-endian
-                    await on_receive_cb(seat, cmd_id, (voltage, soc))
-                # Default handling for other commands (1 byte value)
-                else:
-                    cmd_val = await endpoint.receive_exactly(1)
-                    cmd_val = struct.unpack("B", cmd_val)[0]
-                    await on_receive_cb(seat, cmd_id, cmd_val)
+                    if cmd_id == TcpCommandId.BATTERY_STATUS:
+                        # Now read 8 bytes for voltage + soc (two floats)
+                        data = await endpoint.receive_exactly(8)
+                        voltage, soc = struct.unpack("<ff", data)
+                        logging.debug(f"Got BATTERY_STATUS from seat {seat}: {voltage:.2f}V, {soc:.1f}%")
+                        
+                        # Pass it to your handle callback
+                        await on_receive_cb(seat, cmd_id, (voltage, soc))
+                    else:
+                        # Another command (1 byte more for cmd_val?)
+                        val_raw = await endpoint.receive_exactly(1)
+                        val = struct.unpack("B", val_raw)[0]
+                        logging.debug(f"Got cmd {cmd_id} val {val} from seat {seat}")
+                        await on_receive_cb(seat, cmd_id, val)
         except Exception as e:
-            logging.error(f"Seat {seat} error: {str(e)}")
+            logging.error(f"Seat {seat} reading loop ended: {e}")
