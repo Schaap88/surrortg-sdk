@@ -7,5 +7,6 @@
         "oled",
         "rtype",
         "surrortg"
-    ]
+    ],
+    "python.analysis.autoImportCompletions": true
 }

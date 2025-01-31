@@ -1,0 +1,20 @@
+device_id = "wheel-loader"
+
+[game_engine]
+url = "http://192.168.0.32:3000/signaling"
+
+token = "mariakerkelaan/eyKJmdskjmsdfkjsmdlfkjsdmlfskjdmff"
+
+[rtc_config]
+[[rtc_config.ice_servers]]
+urls = "stun:stun.l.google.com:19302,stun:stun1.l.google.com:19302,stun:stun2.l.google.com:19302,stun:stun3.l.google.com:19302,stun:stun4.l.google.com:19302"
+
+[[sources]]
+kind = "video"
+label = "main"
+
+[sources.video_params]
+type = "v4l2"
+width = 1280
+height = 720
+framerate = 30

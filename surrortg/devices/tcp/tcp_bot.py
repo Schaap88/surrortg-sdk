@@ -4,7 +4,7 @@ import struct
 
 from surrortg import ConfigType
 
-from .tcp_protocol import open_tcp_endpoint
+from .tcp_protocol import TcpCommandId, open_tcp_endpoint
 
 BOT_TCP_PORT = 31338
 CONFIG_IP_ADDR_NAME = "microcontroller_ip_addr"
@@ -211,14 +211,23 @@ class TcpBot:
             must take seat, cmd_id and cmd_val as parameters
         :type on_receive_cb: function
         """
-        logging.info(f"Receiving messages for seat {seat}")
+        """Handles BATTERY_STATUS (9 bytes) and other commands (2 bytes)"""
         endpoint = self.endpoints[seat]
         try:
             while True:
-                data = await endpoint.receive_exactly(2)
-                cmd_id, cmd_val = struct.unpack("BB", data)
-                await on_receive_cb(seat, cmd_id, cmd_val)
-        except asyncio.CancelledError:
-            logging.info(f"Message receiver for seat {seat} cancelled")
-        except ConnectionResetError:
-            logging.error(f"Message receiver for seat {seat} stopped")
+                # Read COMMAND ID (1 byte)
+                cmd_id = await endpoint.receive_exactly(1)
+                cmd_id = struct.unpack("B", cmd_id)[0]
+
+                # Handle BATTERY_STATUS response (8 bytes: 2 floats)
+                if cmd_id == TcpCommandId.BATTERY_STATUS:
+                    response = await endpoint.receive_exactly(8)
+                    voltage, soc = struct.unpack("<ff", response)  # Little-endian
+                    await on_receive_cb(seat, cmd_id, (voltage, soc))
+                # Default handling for other commands (1 byte value)
+                else:
+                    cmd_val = await endpoint.receive_exactly(1)
+                    cmd_val = struct.unpack("B", cmd_val)[0]
+                    await on_receive_cb(seat, cmd_id, cmd_val)
+        except Exception as e:
+            logging.error(f"Seat {seat} error: {str(e)}")

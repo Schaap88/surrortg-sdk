@@ -29,7 +29,7 @@ eval "$(pyenv virtualenv-init -)"
 Then run `source ~/.bashrc`.
 
 Next, install the correct Python version with `pyenv`, by running
-`pyenv install 3.7.8`. Then, to enable the correct Python version to be used
+`pyenv install -v 3.7.8`. Then, to enable the correct Python version to be used
 for SurroRTG SDK, navigate to the root of your cloned `surrortg-sdk` repository
 in your terminal, and run `pyenv local 3.7.8`.
 
