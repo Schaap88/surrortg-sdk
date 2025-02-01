@@ -514,6 +514,23 @@ class GameIO:
         ), f"progress must be between 0-1, was {progress}"
         self._send_threadsafe("progress", seat=seat, payload={"val": progress})
 
+    def send_telemetry(self, payload, seat=0):
+        """Send a custom event to the game engine.
+
+        :param event: Name of the event to send.
+        :type event: str
+        :param seat: Seat number to send the event for (default is 0).
+        :type seat: int
+        :param payload: Dictionary payload to send with the event (default is {}).
+        :type payload: dict, optional
+        """
+
+        assert isinstance(seat, int), "seat must be int"
+        if payload is None:
+            payload = {}
+        self._send_threadsafe("telemetry", seat=seat, payload=payload)
+
+
     def send_score(
         self,
         score=None,

@@ -17,7 +17,8 @@ class Skidsteer(TcpCar):
         lift_mult=1.0,
         tilt_mult=1.0,
     ):
-        super().__init__(game_io)
+        super().__init__(game_io, throttle_mult, steering_mult)
+        self.io = game_io
         self.battery_voltage = None
         self.battery_soc = None
 
@@ -43,6 +44,12 @@ class Skidsteer(TcpCar):
             voltage, soc = data
             logging.info(f"Battery seat {seat}: {voltage:.2f}V, {soc:.1f}%")
             self.battery_voltage, self.battery_soc = voltage, soc
+            
+            # Send to signaling server directly here
+            self.io.send_telemetry(
+                seat=seat,
+                payload={"voltage": voltage, "soc": soc}
+            )
 
     async def request_battery_status(self, seat):
         """Send battery status request without reading."""
