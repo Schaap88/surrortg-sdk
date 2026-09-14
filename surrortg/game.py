@@ -470,21 +470,16 @@ class Game:
         # TODO RD-917 add support for restarting robot from the admin panel
 
     def _parse_seats(self, configs):
-        # Config types or structure are not enforced
-        # so let's check everything before use
+        """Parse canonical v2 Robot routing without inferring identity."""
         seats = []
         if isinstance(configs, dict) and "robots" in configs:
             for robot in configs["robots"]:
-                if isinstance(robot, dict) and "id" in robot:
-                    # Leave option to remove 'robot' from
-                    # the id end at some point
-                    if robot["id"].endswith("robot"):
-                        robot_id = robot["id"][: -len("robot")]
-                    else:
-                        robot_id = robot["id"]
-                    if robot_id == self.io.device_id:
-                        if "seat" in robot and isinstance(robot["seat"], int):
-                            seats.append(robot["seat"])
+                if (
+                    isinstance(robot, dict)
+                    and isinstance(robot.get("robot_id"), str)
+                    and isinstance(robot.get("seat"), int)
+                ):
+                    seats.append(robot["seat"])
 
         if len(seats) == 0:
             logging.warning("No seats could be parsed! Defaulting to seat 0")

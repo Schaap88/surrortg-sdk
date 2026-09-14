@@ -10,6 +10,7 @@ from .custom_config import (
 )
 from .network.message_router import MultiSeatMessageRouter
 from .network.socket_handler import SocketHandler
+from .runtime import ControllerRuntime
 
 SURRORTG_VERSION = "0.2.2"
 
@@ -57,6 +58,9 @@ class GameIO:
         self._game_configs = EMPTY_CONFIG
         self._message_router = MultiSeatMessageRouter(robot_log_handler)
         self._custom_overlay = None
+        self.controller_runtime = ControllerRuntime(
+            self.device_id, self._emit_runtime_event
+        )
 
         # If type is not string (deprecated old interface), assume type is
         # RobotType. Not testing it directly because of circlar imports
@@ -66,7 +70,7 @@ class GameIO:
         self._socket_handler = SocketHandler(
             self._config["game_engine"]["url"],
             query={
-                "clientType": "robot",
+                "clientType": "controller",
                 "robotType": robot_type,
                 "robotVersion": SURRORTG_VERSION,
                 "clientId": self._config["device_id"],
@@ -74,15 +78,20 @@ class GameIO:
                 "token": self._config["game_engine"]["token"],
             },
             message_callbacks=[
+                self.controller_runtime.handle_message,
                 ge_message_handler,
                 self._message_router.handle_message,
             ],
             response_callbacks={self._is_config_message: ge_message_handler},
-            socketio_connect_callback=self._send_controller_ready,
+            socketio_connect_callback=lambda: None,
+            socketio_disconnect_callback=self.controller_runtime.disconnect,
             socketio_logging_level=socketio_logging_level,
         )
         self._can_register_inputs = False
         self._can_register_configs = False
+
+    async def _emit_runtime_event(self, event, payload):
+        await self._send(event, payload=payload)
 
     def _is_config_message(self, message):
         return message.src == "gameEngine" and message.event == "config"
@@ -696,18 +705,6 @@ class GameIO:
     def set_custom_overlay(self, overlay_config):
         # TODO: documentation and type checking
         self._custom_overlay = overlay_config
-
-    def _send_controller_ready(self):
-        if len(self._custom_configs) > 0:
-            configs = self._custom_configs
-        else:
-            configs = {
-                "robotConfigs": self._robot_configs,
-                "gameConfigs": self._game_configs,
-            }
-        msg = {"inputs": self._get_inputs(), "configs": configs}
-        logging.info(f"Sending controller ready: {msg}")
-        self._send_threadsafe("controllerReady", payload=msg)
 
     def _send_threadsafe(
         self, event, src=None, seat=0, payload={}, callback=None

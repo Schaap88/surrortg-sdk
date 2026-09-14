@@ -1,6 +1,7 @@
 import asyncio
 import functools
 import logging
+from urllib.parse import urlencode
 
 import socketio
 
@@ -36,10 +37,10 @@ class ApiClient(socketio.AsyncClientNamespace):
         super().__init__(SOCKETIO_NAMESPACE)
 
     def _get_query_url(self, url, query):
-        url += "?"
-        for key, value in query.items():
-            url += f"{key}={value}&"
-        return url[:-1]
+        if not query:
+            return url
+        separator = "&" if "?" in url else "?"
+        return f"{url}{separator}{urlencode(query)}"
 
     def on_connect(self):
         self.connected = True
@@ -47,7 +48,7 @@ class ApiClient(socketio.AsyncClientNamespace):
             self.connected_future.set_result(True)
             self.connected_future = None
 
-    def on_disconnect(self):
+    def on_disconnect(self, reason=None):
         self.connected = False
         if self.connected_future is not None:
             self.connected_future.set_exception(GEConnectionError())
@@ -98,7 +99,11 @@ class ApiClient(socketio.AsyncClientNamespace):
 
         logging.info(f"connecting to {self.url}")
 
-        await self.sio.connect(self.url, transports="websocket")
+        await self.sio.connect(
+            self.url,
+            transports=["websocket"],
+            namespaces=[SOCKETIO_NAMESPACE],
+        )
 
         if self.connected is not True:
             self.connected_future = asyncio.get_running_loop().create_future()

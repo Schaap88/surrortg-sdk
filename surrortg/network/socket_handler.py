@@ -6,8 +6,10 @@ import socket
 import sys
 import traceback
 from dataclasses import asdict, dataclass, field
+from inspect import isawaitable
 from signal import SIGINT
 from typing import Any, Dict, Optional
+from urllib.parse import urlencode
 
 import socketio
 
@@ -75,6 +77,7 @@ class SocketioNamespace(socketio.AsyncClientNamespace):
         query,
         message_handler,
         on_connect_handler,
+        on_disconnect_handler,
         socketio_logging_level,
         engineio_logging_level,
         *args,
@@ -82,6 +85,7 @@ class SocketioNamespace(socketio.AsyncClientNamespace):
     ):
         self.message_handler = message_handler
         self.on_connect_handler = on_connect_handler
+        self.on_disconnect_handler = on_disconnect_handler
         self.connected = False
         self.socketio_logger = self._get_logger(
             "socketio", socketio_logging_level
@@ -97,13 +101,14 @@ class SocketioNamespace(socketio.AsyncClientNamespace):
         )
         self.url = self._get_query_url(url, query)
         self.sio = None
+        self._shutdown = False
         super().__init__(namespace, *args, **kwargs)
 
     def _get_query_url(self, url, query):
-        url += "?"
-        for key, value in query.items():
-            url += f"{key}={value}&"
-        return url[:-1]
+        if not query:
+            return url
+        separator = "&" if "?" in url else "?"
+        return f"{url}{separator}{urlencode(query)}"
 
     def _get_logger(self, name, level):
         logger = logging.getLogger(name)
@@ -113,14 +118,19 @@ class SocketioNamespace(socketio.AsyncClientNamespace):
             logger.setLevel(level)
         return logger
 
-    def on_connect(self):
+    async def on_connect(self):
         logging.info("socketio: connected")
         self.connected = True
-        self.on_connect_handler()
+        result = self.on_connect_handler()
+        if isawaitable(result):
+            await result
 
-    def on_disconnect(self):
+    async def on_disconnect(self, reason=None):
         logging.info("socketio: disconnected")
         self.connected = False
+        result = self.on_disconnect_handler()
+        if isawaitable(result):
+            await result
 
     async def on_message(self, data, *args):
         msg = None
@@ -160,29 +170,21 @@ class SocketioNamespace(socketio.AsyncClientNamespace):
             )
 
     async def run(self):
-        # manually reconnect every time the socketio gets disconnected
-        # 'await self.sio.wait()' would work with reconnection=True,
-        # but it cannot be interrupted or disconnected
-        while True:
+        while not self._shutdown:
             await self._connect()
-
-            # check periodically if still connected
-            while self.connected:
-                await asyncio.sleep(0.5)
-
-            await self.shutdown()
+            await self.sio.wait()
 
     async def _connect(self):
         logging.info("socketio: connecting...")
         last_exception = None
         sleep = SOCKETIO_CONNECTION_MIN_SLEEP
-        while True:
+        while not self._shutdown:
             try:
                 # create client
                 self.sio = socketio.AsyncClient(
                     logger=self.socketio_logger,
                     engineio_logger=self.engineio_logger,
-                    reconnection=False,
+                    reconnection=True,
                 )
                 # register connect_error handler
 
@@ -196,7 +198,11 @@ class SocketioNamespace(socketio.AsyncClientNamespace):
                 # register namespace
                 self.sio.register_namespace(self)
                 # connect
-                await self.sio.connect(self.url, transports="websocket")
+                await self.sio.connect(
+                    self.url,
+                    transports=["websocket"],
+                    namespaces=[SOCKETIO_NAMESPACE],
+                )
                 # wait that actually connects
                 await asyncio.wait_for(
                     self._wait_for_connected(),
@@ -228,6 +234,7 @@ class SocketioNamespace(socketio.AsyncClientNamespace):
 
     async def shutdown(self):
         logging.info("socketio shutting down...")
+        self._shutdown = True
         if self.sio is not None:
             await self.disconnect()
             await self.sio.disconnect()
@@ -380,6 +387,7 @@ class SocketHandler:
         message_callbacks=[],
         response_callbacks={},
         socketio_connect_callback=lambda: None,
+        socketio_disconnect_callback=lambda: None,
         socketio_logging_level=logging.WARNING,
     ):
         self.message_callbacks = message_callbacks
@@ -390,6 +398,7 @@ class SocketHandler:
             query,
             self._handle_message,
             socketio_connect_callback,
+            socketio_disconnect_callback,
             socketio_logging_level,
             socketio_logging_level,
         )

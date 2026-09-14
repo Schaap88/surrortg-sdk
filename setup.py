@@ -9,8 +9,7 @@ setuptools.setup(
     install_requires=[
         "aiohttp==3.7.4",
         "pigpio",
-        "python-socketio==4.6.1",
-        "python-engineio==3.14.2",
+        "python-socketio==5.16.4",
         "pyyaml",
         "toml",
     ],
@@ -22,5 +21,5 @@ setuptools.setup(
     # url="",
     packages=setuptools.find_packages(include="surrortg"),
     # classifiers=[],
-    python_requires=">=3.7",
+    python_requires=">=3.8",
 )
