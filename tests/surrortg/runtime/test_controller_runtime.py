@@ -127,7 +127,8 @@ class ControllerRuntimeTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.runtime.robot_id_for_seat(2), "418")
         self.assertNotEqual("418", command["controller_id"])
         self.assertEqual(self.events[0][0], "controller.configuration_applied")
-        snapshot = self.events[1][1]
+        snapshot = self.events[-1][1]
+        self.assertEqual(self.events[-1][0], "controller.status_snapshot")
         self.assertEqual(len(snapshot["robots"]), 2)
         self.assertTrue(snapshot["robots"][0]["ready"])
         self.assertFalse(snapshot["robots"][1]["reachable"])
@@ -168,7 +169,7 @@ class ControllerRuntimeTest(unittest.IsolatedAsyncioTestCase):
             ["robot.reachability_changed", "robot.readiness_changed"],
         )
         sequences = [payload["observation_seq"] for _, payload in self.events]
-        self.assertEqual(sequences, [1, 2])
+        self.assertEqual(sequences, [3, 4])
         self.assertFalse(self.events[-1][1]["ready"])
 
     async def test_snapshot_request_requires_current_epoch_and_revision(self):

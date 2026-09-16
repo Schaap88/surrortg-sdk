@@ -1,4 +1,5 @@
 from .backend import Backend, TcpRobotBackend
+from .simulated_backend import SimulatedRobotBackend
 
 
 class BackendRegistry:
@@ -10,6 +11,10 @@ class BackendRegistry:
 
     @staticmethod
     def _default_factory(robot: dict) -> Backend:
+        if robot.get("implementation_kind") == "simulated":
+            return SimulatedRobotBackend(str(robot["robot_id"]), robot["seat"])
+        if robot.get("implementation_kind") != "physical":
+            raise ValueError("Unsupported Robot implementation_kind")
         backend_class = (
             TcpRobotBackend
             if robot.get("runtime_config", {}).get("address")

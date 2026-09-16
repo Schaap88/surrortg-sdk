@@ -392,6 +392,7 @@ class SocketHandler:
     ):
         self.message_callbacks = message_callbacks
         self.response_callbacks = response_callbacks
+        self._run_tasks = []
         self.socketio_namespace = SocketioNamespace(
             SOCKETIO_NAMESPACE,
             url,
@@ -410,15 +411,43 @@ class SocketHandler:
         self.event_loop = asyncio.get_event_loop()
 
         if self.local_socket_handler is None:
-            await self.socketio_namespace.run()
+            tasks = [asyncio.create_task(self.socketio_namespace.run())]
         else:
-            await asyncio.wait(
-                [
-                    self.socketio_namespace.run(),
-                    self.local_socket_handler.run(),
-                ],
+            tasks = [
+                asyncio.create_task(self.socketio_namespace.run()),
+                asyncio.create_task(self.local_socket_handler.run()),
+            ]
+
+        self._run_tasks = tasks
+        try:
+            done, pending = await asyncio.wait(
+                tasks,
                 return_when=asyncio.FIRST_COMPLETED,
             )
+
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+            for task in done:
+                exc = task.exception()
+                if exc is not None:
+                    raise exc
+        except asyncio.CancelledError:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+        finally:
+            for task in list(self._run_tasks):
+                if not task.done():
+                    task.cancel()
+            if self._run_tasks:
+                await asyncio.gather(
+                    *self._run_tasks, return_exceptions=True
+                )
+            self._run_tasks = []
 
     async def _handle_message(self, msg):
         # use the correct response callback if exists
@@ -509,6 +538,13 @@ class SocketHandler:
 
     async def shutdown(self):
         """Shuts down SocketHandler gracefully with logging"""
+        for task in list(self._run_tasks):
+            if not task.done():
+                task.cancel()
+        if self._run_tasks:
+            await asyncio.gather(*self._run_tasks, return_exceptions=True)
+        self._run_tasks = []
+
         await self.socketio_namespace.shutdown()
         if self.local_socket_handler is not None:
             self.local_socket_handler.shutdown()

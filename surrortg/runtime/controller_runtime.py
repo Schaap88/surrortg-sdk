@@ -1,5 +1,6 @@
 import hashlib
 import json
+import logging
 import time
 from datetime import datetime, timezone
 
@@ -37,8 +38,12 @@ class ControllerRuntime:
         self._last_operation = None
         self._neutralization_results = {}
         self._result_cache_ttl = result_cache_ttl
+        self._peers = {}
+        self._enabled_seats = set()
 
     async def handle_message(self, message):
+        if message.event in {"newPeer", "peerLeft", "enableRouting", "disableRouting", "gameControls"}:
+            return await self._handle_controls(message)
         if message.event == CONFIGURE:
             return await self.apply_configuration(message.payload)
         if message.event == SNAPSHOT_REQUEST:
@@ -53,6 +58,30 @@ class ControllerRuntime:
         if message.event == CONFIRM_READINESS:
             return await self.confirm_readiness(message.payload)
         return False
+
+    async def _handle_controls(self, message):
+        if message.dst != self.controller_id:
+            return False
+        payload = message.payload or {}
+        if message.event == "gameControls":
+            seat = self._peers.get(message.src)
+            if seat is None or seat != message.seat or seat not in self._enabled_seats:
+                return False
+            robot_id = self.robot_id_for_seat(seat)
+            if robot_id is None:
+                return False
+            return await self.robots[robot_id]["backend"].apply_control(payload)
+        if message.src != "gameEngine":
+            return False
+        if message.event == "newPeer" and payload.get("seat") in self.seats:
+            self._peers[payload["id"]] = payload["seat"]
+        elif message.event == "peerLeft":
+            self._peers.pop(payload.get("id"), None)
+        elif message.event == "enableRouting":
+            self._enabled_seats.update([payload["seat"]] if "seat" in payload else self.seats)
+        elif message.event == "disableRouting":
+            self._enabled_seats.difference_update([payload["seat"]] if "seat" in payload else self.seats)
+        return True
 
     async def confirm_readiness(self, command):
         valid = self._valid_robot_command(command) and command.get("reservation_id")
@@ -120,6 +149,9 @@ class ControllerRuntime:
         for observation in self._observations.values():
             observation["reachable"] = False
             observation["ready"] = False
+        self._peers.clear()
+        self._enabled_seats.clear()
+        self.connection_epoch = None
 
     async def apply_configuration(self, command):
         operation = self._operation_key(command)
@@ -164,6 +196,8 @@ class ControllerRuntime:
 
         previous = self.robots
         self.robots = candidates
+        self._peers.clear()
+        self._enabled_seats.clear()
         self.seats = {robot["seat"]: robot_id for robot_id, robot in candidates.items()}
         self.game_id = str(command["game_id"])
         self.connection_epoch = command["connection_epoch"]
@@ -171,13 +205,27 @@ class ControllerRuntime:
         self.applied_config_digest = command["config_digest"]
         self._last_operation = operation
         self._observations = {robot_id: {"seq": 0, "reachable": False, "ready": False, "faults": {}} for robot_id in candidates}
+        initial_statuses = {}
         for robot_id, candidate in candidates.items():
-            self._install_status(robot_id, candidate.pop("status"))
+            initial_statuses[robot_id] = candidate.pop("status")
+            backend = candidate["backend"]
+
+            async def observed(status, robot_id=robot_id, backend=backend):
+                # Discard callbacks from replaced backends or disconnected epochs.
+                if self.robots.get(robot_id, {}).get("backend") is backend and self.connection_epoch is not None:
+                    await self.update_robot_status(robot_id, status)
+
+            backend.subscribe(observed)
         for old in previous.values():
             await old["backend"].stop()
 
         await self._emit("controller.configuration_applied", self._ack(command))
+        logging.info("runtime > Controller %s configuration applied revision=%s", self.controller_id, self.applied_config_revision)
+        for robot_id, status in initial_statuses.items():
+            await self.update_robot_status(robot_id, status)
         await self.emit_snapshot()
+        for robot_id, observation in self._observations.items():
+            logging.info("runtime > Robot %s reachable=%s ready=%s", robot_id, observation["reachable"], observation["ready"])
         return True
 
     async def update_robot_status(self, robot_id, status):

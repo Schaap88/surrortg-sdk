@@ -36,6 +36,10 @@ class Backend:
         """Return a truthful terminal status; generic backends cannot prove it."""
         return "unsupported"
 
+    async def apply_control(self, control: dict) -> bool:
+        """Optional normalized input sink; legacy physical inputs remain in GameIO."""
+        return False
+
     def subscribe(self, callback) -> None:
         self._status_callback = callback
 
@@ -46,10 +50,10 @@ class TcpRobotBackend(Backend):
     def __init__(self, robot_id: str, seat: int, connector=None):
         super().__init__(robot_id, seat)
         if connector is None:
-            from surrortg.devices.tcp.tcp_bot import BOT_TCP_PORT
-            from surrortg.devices.tcp.tcp_protocol import open_tcp_endpoint
-
             async def connector(address):
+                from surrortg.devices.tcp.tcp_bot import BOT_TCP_PORT
+                from surrortg.devices.tcp.tcp_protocol import open_tcp_endpoint
+
                 return await open_tcp_endpoint(address, BOT_TCP_PORT)
 
         self._connector = connector

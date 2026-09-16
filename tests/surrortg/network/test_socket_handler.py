@@ -1,8 +1,11 @@
+import asyncio
 import unittest
+import warnings
 from unittest.mock import patch
 
 from surrortg.network.socket_handler import (
     SOCKETIO_NAMESPACE,
+    SocketHandler,
     SocketioNamespace,
 )
 
@@ -98,6 +101,61 @@ class SocketioNamespaceTest(unittest.IsolatedAsyncioTestCase):
             lifecycle, ["connected", "disconnected", "connected"]
         )
         self.assertTrue(namespace.connected)
+
+
+class SocketHandlerTest(unittest.IsolatedAsyncioTestCase):
+    async def test_run_schedules_both_handlers_and_works_on_python_313(self):
+        handler = SocketHandler("https://signaling.example")
+
+        async def socketio_run():
+            await asyncio.sleep(0.01)
+
+        async def local_run():
+            await asyncio.sleep(0.02)
+
+        handler.socketio_namespace.run = socketio_run
+        handler.local_socket_handler.run = local_run
+
+        run_task = asyncio.create_task(handler.run())
+        await asyncio.sleep(0)
+
+        self.assertEqual(len(handler._run_tasks), 2)
+        self.assertTrue(all(task.done() is False for task in handler._run_tasks))
+
+        await asyncio.wait_for(run_task, timeout=1)
+
+    async def test_shutdown_cancels_pending_run_tasks(self):
+        handler = SocketHandler("https://signaling.example")
+
+        async def block():
+            await asyncio.sleep(999)
+
+        handler._run_tasks = [
+            asyncio.create_task(block()),
+            asyncio.create_task(block()),
+        ]
+
+        await handler.shutdown()
+
+        self.assertTrue(all(task.done() for task in handler._run_tasks))
+        self.assertListEqual(handler._run_tasks, [])
+
+    async def test_child_exception_is_propagated_without_unawaited_coroutine_warning(self):
+        handler = SocketHandler("https://signaling.example")
+
+        async def socketio_run():
+            raise RuntimeError("socketio boom")
+
+        async def local_run():
+            await asyncio.sleep(999)
+
+        handler.socketio_namespace.run = socketio_run
+        handler.local_socket_handler.run = local_run
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", RuntimeWarning)
+            with self.assertRaisesRegex(RuntimeError, "socketio boom"):
+                await handler.run()
 
 
 if __name__ == "__main__":

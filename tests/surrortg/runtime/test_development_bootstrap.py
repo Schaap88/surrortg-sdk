@@ -14,9 +14,9 @@ class DevelopmentBootstrapTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(config['game_engine']['url'], 'http://127.0.0.1:3000/signaling')
         self.assertNotIn('sources', config)
 
-    async def test_unconfigured_software_backend_cannot_claim_readiness_or_safety(self):
+    async def test_unconfigured_physical_backend_cannot_claim_readiness_or_safety(self):
         backend = BackendRegistry().create({
-            'robot_id': '1', 'seat': 0, 'implementation_kind': 'simulated',
+            'robot_id': '1', 'seat': 0, 'implementation_kind': 'physical',
             'runtime_config': {},
         })
         await backend.apply_configuration({})
