@@ -6,3 +6,10 @@ docs/source/modules/
 surrortg.egg-info/
 .python-version
 *config_local.py
+
+# Controller identities, tokens, and machine/site-specific endpoints.
+/configs/articulated-dump-truck/srtg.toml
+/configs/articulated-dump-truck/srtg.production.toml
+/configs/wheel-loader/srtg.toml
+/configs/wheel-loader/srtg.production.toml
+/games/wheel_loader/config.toml

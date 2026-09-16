@@ -1,0 +1,8 @@
+# B4 seeded local fixtures only. Run with games.dummy_game.game; no media/hardware.
+device_id = "dev-controller-001"
+
+[game_engine]
+url = "http://127.0.0.1:3000/signaling"
+# Numeric Platform Game ID after migrate:fresh --seed.
+id = "1"
+token = "groundbreaking-local-controller-token"

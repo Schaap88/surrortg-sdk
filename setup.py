@@ -7,7 +7,7 @@ setuptools.setup(
     name="surrortg",
     version="0.0.4",
     install_requires=[
-        "aiohttp==3.7.4",
+        "aiohttp==3.11.18",
         "pigpio",
         "python-socketio==5.16.4",
         "pyyaml",
