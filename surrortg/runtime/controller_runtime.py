@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 
 from .backend import BackendStatus
 from .backend_registry import BackendRegistry
+from .simulated_world import SimulatedWorld
 
 PROTOCOL_VERSION = "2.0"
 CONFIGURE = "controller.configure"
@@ -23,7 +24,8 @@ class ControllerRuntime:
     def __init__(self, controller_id, emit, backend_registry=None, clock=None, result_cache_ttl=300):
         self.controller_id = str(controller_id)
         self._emit = emit
-        self._backends = backend_registry or BackendRegistry()
+        self.simulated_world = SimulatedWorld(publish=self._emit_world_snapshot)
+        self._backends = backend_registry or BackendRegistry(simulated_world=self.simulated_world)
         self._clock = clock or (
             lambda: datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         )
@@ -40,6 +42,9 @@ class ControllerRuntime:
         self._result_cache_ttl = result_cache_ttl
         self._peers = {}
         self._enabled_seats = set()
+
+    async def _emit_world_snapshot(self, snapshot):
+        await self._emit("simulation.world_snapshot", snapshot)
 
     async def handle_message(self, message):
         if message.event in {"newPeer", "peerLeft", "enableRouting", "disableRouting", "gameControls"}:
@@ -200,6 +205,7 @@ class ControllerRuntime:
         self._enabled_seats.clear()
         self.seats = {robot["seat"]: robot_id for robot_id, robot in candidates.items()}
         self.game_id = str(command["game_id"])
+        self.simulated_world.configure(self.game_id, self._emit_world_snapshot)
         self.connection_epoch = command["connection_epoch"]
         self.applied_config_revision = command["config_revision"]
         self.applied_config_digest = command["config_digest"]

@@ -3,11 +3,15 @@ from .simulated_backend import SimulatedRobotBackend
 
 
 class BackendRegistry:
-    def __init__(self, factory=None):
+    def __init__(self, factory=None, simulated_world=None):
         self._factory = factory or self._default_factory
+        self.simulated_world = simulated_world
 
     def create(self, robot: dict) -> Backend:
-        return self._factory(robot)
+        backend = self._factory(robot)
+        if isinstance(backend, SimulatedRobotBackend) and self.simulated_world:
+            backend.world = self.simulated_world
+        return backend
 
     @staticmethod
     def _default_factory(robot: dict) -> Backend:

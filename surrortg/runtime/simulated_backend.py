@@ -13,15 +13,17 @@ class SimulatedRobotBackend(Backend):
     Neutralization retains each input's shape and zeroes every output.
     """
 
-    def __init__(self, robot_id, seat):
+    def __init__(self, robot_id, seat, world=None):
         super().__init__(robot_id, seat)
         self.started = False
         self.neutralized = True
         self.last_control = None
         self.outputs = {}
+        self.world = world
 
     async def start(self):
         self.started = True
+        self.world and self.world.add(self.robot_id, self.seat)
         await self.set_state(reachable=True, ready=True)
 
     async def stop(self):
@@ -29,6 +31,7 @@ class SimulatedRobotBackend(Backend):
         self.outputs = self._neutral(self.outputs)
         self.last_control = None
         self.neutralized = True
+        self.world and self.world.remove(self.robot_id)
         await self.set_state(reachable=False, ready=False)
 
     async def set_state(self, *, reachable, ready, faults=()):
@@ -62,6 +65,7 @@ class SimulatedRobotBackend(Backend):
         # is enforced by ControllerRuntime's current peer/seat routing.
         self.last_control = deepcopy(control)
         self.outputs[control["id"]] = deepcopy(control["command"])
+        self.world and self.world.control(self.robot_id, control)
         self.neutralized = self.outputs == self._neutral(self.outputs)
         logging.info("runtime > Robot %s control applied outputs=%s", self.robot_id, self.outputs)
         return True
@@ -72,6 +76,7 @@ class SimulatedRobotBackend(Backend):
         self.outputs = self._neutral(self.outputs)
         self.last_control = None
         self.neutralized = self.outputs == self._neutral(self.outputs)
+        self.world and self.world.neutralize(self.robot_id)
         status = "succeeded" if self.neutralized else "failed"
         logging.info("runtime > Robot %s neutralization %s outputs=%s", self.robot_id, status, self.outputs)
         return status
