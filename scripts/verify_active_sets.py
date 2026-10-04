@@ -11,6 +11,7 @@ import uuid
 
 import aiohttp
 import socketio
+from controller_admission import development_runtime_config
 
 
 async def platform_eval(platform, code, *args):
@@ -135,7 +136,7 @@ async def verify(port, output_dir):
         return json.loads(await php("echo App\\Models\\PlayerSession::whereIn('id', json_decode($argv[1], true))->orderBy('allocated_at')->get()->toJson();", json.dumps(ids)))
 
     try:
-        config = await get("controllers/dev-controller-001/runtime-config")
+        config = await development_runtime_config(http)
         domain = await get(f"games/{config['game_id']}/runtime-domain")
         option = next(q for q in domain["queue_options"] if q["name"] == "Standard")
         assert len([q for q in domain["queue_options"] if q["enabled"]]) == 1, "Requires the one-option DevelopmentSeeder Game"
@@ -154,7 +155,7 @@ async def verify(port, output_dir):
             "return $original + ['extra_robot_ids' => $extra, 'set_ids' => array_map(fn ($s) => $s->id, $sets)]; }); echo json_encode($result);",
             robot["robot_id"], option["id"]))
         (output_dir / "fixture.json").write_text(json.dumps(fixture, indent=2))
-        config = await get("controllers/dev-controller-001/runtime-config")
+        config = await development_runtime_config(http)
         ids = [robot["robot_id"], *map(str, fixture["extra_robot_ids"])]
         config_path = output_dir / "srtg.toml"
         config_path.write_text((sdk / "configs/development/srtg.example.toml").read_text().replace(":3000/", f":{port}/"))

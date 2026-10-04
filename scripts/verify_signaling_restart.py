@@ -13,6 +13,7 @@ import tempfile
 import aiohttp
 from aiohttp import web
 import socketio
+from controller_admission import development_runtime_config
 
 
 async def verify(port, proxy_port, output_dir):
@@ -81,7 +82,8 @@ async def verify(port, proxy_port, output_dir):
     def allocations(): return re.findall(r"readiness confirmed allocation=([\w-]+)", "".join(logs["signaling"]))
     def controls(): return sum("control applied outputs=" in line for line in logs["sdk"])
 
-    config = await get("controllers/dev-controller-001/runtime-config")
+    async with aiohttp.ClientSession() as admission_http:
+        config = await development_runtime_config(admission_http)
     domain = await get(f"games/{config['game_id']}/runtime-domain")
     option = next(q for q in domain["queue_options"] if q["name"] == "Standard")
     robot = next(r for r in config["robots"] if r["implementation_kind"] == "simulated")

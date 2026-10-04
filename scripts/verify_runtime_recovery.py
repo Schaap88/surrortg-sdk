@@ -15,6 +15,7 @@ import tempfile
 
 import aiohttp
 import socketio
+from controller_admission import development_runtime_config
 
 
 async def verify(port, output_dir):
@@ -26,7 +27,7 @@ async def verify(port, output_dir):
             async with http.get(f"http://127.0.0.1:8000/api/ge/v2/{path}") as response:
                 response.raise_for_status()
                 return await response.json()
-        config = await get("controllers/dev-controller-001/runtime-config")
+        config = await development_runtime_config(http)
         domain = await get(f"games/{config['game_id']}/runtime-domain")
     robot = next(r for r in config["robots"] if r["implementation_kind"] == "simulated")
     option = next(q for q in domain["queue_options"] if q["name"] == "Standard")

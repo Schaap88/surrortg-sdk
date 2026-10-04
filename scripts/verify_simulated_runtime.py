@@ -14,6 +14,7 @@ import tempfile
 
 import aiohttp
 import socketio
+from controller_admission import development_runtime_config
 
 
 async def verify(port, output_dir):
@@ -26,7 +27,7 @@ async def verify(port, output_dir):
                 response.raise_for_status()
                 return await response.json()
 
-        config = await get("controllers/dev-controller-001/runtime-config")
+        config = await development_runtime_config(session)
         domain = await get(f"games/{config['game_id']}/runtime-domain")
     async def platform_eval(code, *arguments):
         bootstrap = "require 'vendor/autoload.php'; $app = require 'bootstrap/app.php'; $app->make(Illuminate\\Contracts\\Console\\Kernel::class)->bootstrap(); "
