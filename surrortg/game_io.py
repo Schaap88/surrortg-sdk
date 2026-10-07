@@ -1,7 +1,8 @@
 import logging
+import os
 from enum import Enum
 
-from .config_parser import get_config
+from .config_parser import get_controller_config
 from .custom_config import (
     EMPTY_CONFIG,
     ConfigType,
@@ -10,6 +11,7 @@ from .custom_config import (
 )
 from .network.message_router import MultiSeatMessageRouter
 from .network.socket_handler import SocketHandler
+from .management_ipc import ManagementServer
 from .runtime import ControllerRuntime
 
 SURRORTG_VERSION = "0.2.2"
@@ -47,7 +49,7 @@ class GameIO:
         robot_type,
         device_id,
     ):
-        self._config = get_config(config_path)
+        self._config = get_controller_config(config_path)
 
         if device_id is not None:
             self._config["device_id"] = device_id
@@ -75,8 +77,8 @@ class GameIO:
                 "robotVersion": SURRORTG_VERSION,
                 "clientId": self._config["device_id"],
                 "gameId": self._config["game_engine"]["id"],
-                "token": self._config["game_engine"]["token"],
             },
+            auth={"credential": self._config["game_engine"]["token"]},
             message_callbacks=[
                 self.controller_runtime.handle_message,
                 ge_message_handler,
@@ -87,8 +89,18 @@ class GameIO:
             socketio_disconnect_callback=self.controller_runtime.disconnect,
             socketio_logging_level=socketio_logging_level,
         )
+        self.management_server = ManagementServer(
+            self._local_status,
+            self._socket_handler.reconnect,
+            socket_path=os.environ.get("SURRORTG_MANAGEMENT_SOCKET"),
+        )
         self._can_register_inputs = False
         self._can_register_configs = False
+
+    async def _local_status(self):
+        return await self.controller_runtime.local_status(
+            self._socket_handler.socketio_namespace.connected
+        )
 
     async def _emit_runtime_event(self, event, payload):
         await self._send(event, payload=payload)

@@ -4,6 +4,8 @@ import socket
 
 import toml
 
+from .controller_config import load_runtime_config
+
 REQUIRED_CONFIG_KEYS = ["device_id", "game_engine"]
 REQUIRED_CONFIG_GE_KEYS = ["url", "token"]
 
@@ -49,6 +51,11 @@ def get_config(config_path=None, default_config_path="/etc/srtg/srtg.toml"):
             )
 
     return config
+
+
+def get_controller_config(config_path=None):
+    """Load new storage, while preserving explicit legacy ``-c`` behavior."""
+    return load_runtime_config(explicit_legacy_path=config_path)
 
 
 def _get_current_ge_config_path(

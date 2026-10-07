@@ -75,6 +75,7 @@ class SocketioNamespace(socketio.AsyncClientNamespace):
         namespace,
         url,
         query,
+        auth,
         message_handler,
         on_connect_handler,
         on_disconnect_handler,
@@ -100,6 +101,7 @@ class SocketioNamespace(socketio.AsyncClientNamespace):
             else url
         )
         self.url = self._get_query_url(url, query)
+        self.auth = dict(auth or {})
         self.sio = None
         self._shutdown = False
         super().__init__(namespace, *args, **kwargs)
@@ -190,16 +192,21 @@ class SocketioNamespace(socketio.AsyncClientNamespace):
 
                 @self.sio.event(namespace=SOCKETIO_NAMESPACE)
                 def connect_error(msg):
-                    logging.error(f"GE socketio connection error: {msg}")
+                    # Admission errors are category-only. Never interpolate
+                    # handshake data or a library diagnostic that may echo it.
+                    category = msg.get("category") if isinstance(msg, dict) else None
+                    logging.error(
+                        "GE socketio connection rejected: %s",
+                        category or "connection_error",
+                    )
                     self.connected = False
-                    if "Invalid robot token" in msg:
-                        sys.exit(2)
 
                 # register namespace
                 self.sio.register_namespace(self)
                 # connect
                 await self.sio.connect(
                     self.url,
+                    auth=self.auth,
                     transports=["websocket"],
                     namespaces=[SOCKETIO_NAMESPACE],
                 )
@@ -216,14 +223,16 @@ class SocketioNamespace(socketio.AsyncClientNamespace):
                     logging.info(
                         f"socketio: {SOCKETIO_NAMESPACE} did not connect"
                     )
-                elif str(e) == last_exception:
+                elif type(e).__name__ == last_exception:
                     logging.warning(
                         "socketio: did not connect, "
                         "same error as the previous"
                     )
                 else:
-                    logging.warning(f"socketio: did not connect, {e}")
-                    last_exception = str(e)
+                    logging.warning(
+                        "socketio: did not connect (%s)", type(e).__name__
+                    )
+                    last_exception = type(e).__name__
                 await asyncio.sleep(sleep)
                 sleep = min(SOCKETIO_CONNECTION_MAX_SLEEP, sleep * 2)
 
@@ -384,6 +393,7 @@ class SocketHandler:
         self,
         url,
         query={},
+        auth=None,
         message_callbacks=[],
         response_callbacks={},
         socketio_connect_callback=lambda: None,
@@ -397,6 +407,7 @@ class SocketHandler:
             SOCKETIO_NAMESPACE,
             url,
             query,
+            auth,
             self._handle_message,
             socketio_connect_callback,
             socketio_disconnect_callback,
@@ -549,6 +560,15 @@ class SocketHandler:
         if self.local_socket_handler is not None:
             self.local_socket_handler.shutdown()
         logging.info("SocketHandler shut down gracefully")
+
+    async def reconnect(self):
+        """Idempotently reconnect only the Socket.IO transport."""
+        namespace = self.socketio_namespace
+        if namespace.sio is None or not namespace.connected:
+            return {"requested": False, "state": "already_disconnected"}
+        namespace.connected = False
+        await namespace.sio.disconnect()
+        return {"requested": True, "state": "reconnecting"}
 
 
 if __name__ == "__main__":

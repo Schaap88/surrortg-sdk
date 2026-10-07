@@ -348,6 +348,9 @@ class Game:
 
         # play the game until interrupted, terminated or crashed
         self._main_task = asyncio.create_task(self.io._socket_handler.run())
+        self._management_task = asyncio.create_task(
+            self.io.management_server.run()
+        )
 
         # add signal handlers
         self._loop = asyncio.get_running_loop()
@@ -360,7 +363,12 @@ class Game:
         self._loop.add_signal_handler(SIGUSR1, self._request_update)
 
         try:
-            await self._main_task
+            done, pending = await asyncio.wait(
+                [self._main_task, self._management_task],
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for task in done:
+                await task
         except asyncio.CancelledError:
             # if asyncio.CancelledError --> was ended on purpose
             await self._exit_correctly()
@@ -403,6 +411,7 @@ class Game:
 
         # shut down connections
         await self.io._socket_handler.shutdown()
+        await self.io.management_server.close()
 
         # run() should now move to _post_run()
 

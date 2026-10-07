@@ -53,8 +53,8 @@ class SocketioNamespaceTest(unittest.IsolatedAsyncioTestCase):
                 "clientType": "controller",
                 "clientId": "controller a",
                 "gameId": "12",
-                "token": "a&b",
             },
+            {"credential": "a&b"},
             lambda message: None,
             lambda: connected.append(True),
             lambda: None,
@@ -75,16 +75,18 @@ class SocketioNamespaceTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             url,
             "https://signaling.example?clientType=controller&clientId="
-            "controller+a&gameId=12&token=a%26b",
+            "controller+a&gameId=12",
         )
         self.assertEqual(options["namespaces"], [SOCKETIO_NAMESPACE])
         self.assertEqual(options["transports"], ["websocket"])
+        self.assertEqual(options["auth"], {"credential": "a&b"})
 
     async def test_disconnect_callback_runs_before_reconnect(self):
         lifecycle = []
         namespace = SocketioNamespace(
             SOCKETIO_NAMESPACE,
             "https://signaling.example",
+            {},
             {},
             lambda message: None,
             lambda: lifecycle.append("connected"),

@@ -1,4 +1,9 @@
 from .config_parser import get_config
+from .controller_config import (
+    ChangeEffect,
+    ControllerConfig,
+    ControllerConfigurationStore,
+)
 from .custom_config import ConfigType
 from .custom_overlay import (
     Position,

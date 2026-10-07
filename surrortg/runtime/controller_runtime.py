@@ -158,6 +158,46 @@ class ControllerRuntime:
         self._enabled_seats.clear()
         self.connection_epoch = None
 
+    async def local_status(self, transport_connected=False):
+        """Return sanitized observations; this is never Game authority."""
+        robots = []
+        for robot_id, robot in self.robots.items():
+            observation = self._observations.get(robot_id, {})
+            reachable = observation.get("reachable") is True
+            faults = [
+                {key: fault[key] for key in (
+                    "fault_id", "code", "severity", "observed_at"
+                ) if key in fault}
+                for fault in observation.get("faults", {}).values()
+            ]
+            robots.append({
+                "robot_id": robot_id,
+                "seat": robot["seat"],
+                "backend_reachable": reachable,
+                "ready": reachable and observation.get("ready") is True,
+                "faults": faults,
+            })
+        return {
+            "runtime": {"reachable": True, "state": "running"},
+            "transport": {
+                "connected": bool(transport_connected),
+                "state": "connected" if transport_connected else "disconnected",
+            },
+            "admission": {
+                "state": "admitted" if self.connection_epoch else (
+                    "pending" if transport_connected else "not_admitted"
+                ),
+                "game_id": self.game_id,
+                "controller_id": self.controller_id,
+                "connection_epoch": self.connection_epoch,
+            },
+            "applied_configuration": {
+                "revision": self.applied_config_revision,
+                "digest": self.applied_config_digest,
+            },
+            "robots": robots,
+        }
+
     async def apply_configuration(self, command):
         operation = self._operation_key(command)
         if operation == self._last_operation:
