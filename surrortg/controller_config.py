@@ -232,7 +232,11 @@ def load_runtime_config(explicit_legacy_path=None, store=None, legacy_path=DEFAU
     if explicit_legacy_path is not None:
         config, credential = _parse_legacy(explicit_legacy_path)
         return config.legacy_runtime(credential)
-    store = store or ControllerConfigurationStore()
+    store = store or ControllerConfigurationStore(
+        os.environ.get("SURRORTG_CONFIG_PATH", DEFAULT_CONFIG_PATH),
+        os.environ.get("SURRORTG_CREDENTIAL_PATH", DEFAULT_SECRET_PATH),
+    )
+    legacy_path = os.environ.get("SURRORTG_LEGACY_CONFIG_PATH", legacy_path)
     if not store.config_path.exists():
         store.import_legacy(legacy_path)
     return store.load().legacy_runtime(store.load_secret())

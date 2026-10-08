@@ -173,6 +173,7 @@ class ControllerRuntime:
             robots.append({
                 "robot_id": robot_id,
                 "seat": robot["seat"],
+                "implementation_kind": robot.get("implementation_kind"),
                 "backend_reachable": reachable,
                 "ready": reachable and observation.get("ready") is True,
                 "faults": faults,
