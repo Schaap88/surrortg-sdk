@@ -3,10 +3,10 @@ import logging
 import struct
 
 from surrortg import ConfigType
+from surrortg.tcp_transport import BOT_TCP_PORT
 
 from .tcp_protocol import TcpCommandId, open_tcp_endpoint
 
-BOT_TCP_PORT = 31338
 CONFIG_IP_ADDR_NAME = "microcontroller_ip_addr"
 set_file_name = "/var/lib/srtg/current_set"
 

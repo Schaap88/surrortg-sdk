@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import json
 import logging
@@ -81,11 +82,15 @@ class ControllerRuntime:
         if message.event == "newPeer" and payload.get("seat") in self.seats:
             self._peers[payload["id"]] = payload["seat"]
         elif message.event == "peerLeft":
-            self._peers.pop(payload.get("id"), None)
+            seat = self._peers.pop(payload.get("id"), None)
+            if seat is not None:
+                await self._neutralize_seats((seat,))
         elif message.event == "enableRouting":
             self._enabled_seats.update([payload["seat"]] if "seat" in payload else self.seats)
         elif message.event == "disableRouting":
-            self._enabled_seats.difference_update([payload["seat"]] if "seat" in payload else self.seats)
+            seats = [payload["seat"]] if "seat" in payload else list(self.seats)
+            self._enabled_seats.difference_update(seats)
+            await self._neutralize_seats(seats)
         return True
 
     async def confirm_readiness(self, command):
@@ -151,12 +156,36 @@ class ControllerRuntime:
 
     def disconnect(self):
         """Invalidate transport-scoped positive observations."""
+        try:
+            asyncio.get_running_loop().create_task(
+                self._neutralize_seats(tuple(self.seats))
+            )
+        except RuntimeError:
+            pass
         for observation in self._observations.values():
             observation["reachable"] = False
             observation["ready"] = False
         self._peers.clear()
         self._enabled_seats.clear()
         self.connection_epoch = None
+
+    async def shutdown(self):
+        """Fail safe and release all configured backends on orderly exit."""
+        await self._neutralize_seats(tuple(self.seats))
+        for robot in self.robots.values():
+            await robot["backend"].stop()
+
+    async def _neutralize_seats(self, seats):
+        for seat in set(seats):
+            robot_id = self.robot_id_for_seat(seat)
+            if robot_id is None:
+                continue
+            try:
+                await self.robots[robot_id]["backend"].neutralize()
+            except Exception:
+                logging.exception(
+                    "runtime > Robot %s neutralization attempt failed", robot_id
+                )
 
     async def local_status(self, transport_connected=False):
         """Return sanitized observations; this is never Game authority."""
@@ -296,6 +325,18 @@ class ControllerRuntime:
         for fault_id in old["faults"].keys() - new_faults.keys():
             await self._emit_robot("robot.fault_cleared", robot_id, {"fault_id": fault_id})
         old["faults"] = new_faults
+        logging.info(
+            "runtime > Robot %s seat=%s kind=%s reachable=%s ready=%s faults=%s",
+            robot_id,
+            self.robots[robot_id]["seat"],
+            self.robots[robot_id]["implementation_kind"],
+            reachable,
+            ready,
+            sorted(
+                fault.get("code", fault_id)
+                for fault_id, fault in new_faults.items()
+            ),
+        )
         return True
 
     async def emit_snapshot(self):

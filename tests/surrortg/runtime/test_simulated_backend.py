@@ -20,7 +20,7 @@ class SimulatedBackendTest(unittest.IsolatedAsyncioTestCase):
         self.assertIs(type(backend), Backend)
         self.assertFalse((await backend.status()).ready)
         self.assertEqual(await backend.neutralize(), "unsupported")
-        self.assertEqual(await TcpRobotBackend("2", 1).neutralize(), "unsupported")
+        self.assertEqual(await TcpRobotBackend("2", 1).neutralize(), "rejected")
 
     async def test_lifecycle_fault_recovery_controls_and_verified_neutral(self):
         backend = SimulatedRobotBackend("1", 0)

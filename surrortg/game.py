@@ -408,6 +408,7 @@ class Game:
         # wait for on_exit to finish
         await self.on_exit(self._exit_reason, self._exception)
         await self.io.shutdown_inputs()
+        await self.io.controller_runtime.shutdown()
 
         # shut down connections
         await self.io._socket_handler.shutdown()
