@@ -114,6 +114,11 @@ async def eventually(predicate, timeout=0.5):
 
 
 class TcpRobotBackendTest(unittest.IsolatedAsyncioTestCase):
+    def test_full_scale_throttle_rounds_joystick_edge_to_protocol_edges(self):
+        self.assertEqual(TcpRobotBackend._frame(1, 1.0, "throttle"), b"\x01\xc8")
+        self.assertEqual(TcpRobotBackend._frame(1, 0.9999, "throttle"), b"\x01\xc8")
+        self.assertEqual(TcpRobotBackend._frame(1, -0.9999, "throttle"), b"\x01\x00")
+
     async def configure(self, backend):
         await backend.apply_configuration({"address": "robot.local"})
         return backend
@@ -179,7 +184,7 @@ class TcpRobotBackendTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(status.faults[0]["fault_id"], "physical-tcp")
                 await backend.stop()
 
-    async def test_controls_preserve_legacy_scaling_and_neutral_values(self):
+    async def test_controls_apply_runtime_scaling_and_neutral_values(self):
         async with FakeEsp32() as server:
             backend = await self.configure(backend_for(server))
             await backend.start()
@@ -203,7 +208,7 @@ class TcpRobotBackendTest(unittest.IsolatedAsyncioTestCase):
                 if frame not in (b"\xc8\x00", b"\x64\x00")
             ]
             self.assertEqual(controls, [
-                b"\x03\x78", b"\x01\x32", b"\x05\x96", b"\x07\x32",
+                b"\x03\x78", b"\x01\x00", b"\x05\x96", b"\x07\x32",
                 b"\x03\x64", b"\x01\x64",
             ])
             await backend.stop()

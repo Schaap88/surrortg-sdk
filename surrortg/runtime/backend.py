@@ -3,6 +3,7 @@ import logging
 import math
 import re
 import struct
+import time
 from copy import deepcopy
 from dataclasses import dataclass, field
 
@@ -65,10 +66,11 @@ class TcpRobotBackend(Backend):
     COMMANDS = {"lift": 5, "tilt": 7}
     MULTIPLIERS = {
         "steering": 0.2,
-        "throttle": 0.5,
+        "throttle": 1.0,
         "lift": 1.0,
         "tilt": 1.0,
     }
+    CONTROL_DIAGNOSTIC_INTERVAL = 0.5
 
     def __init__(
         self,
@@ -103,6 +105,7 @@ class TcpRobotBackend(Backend):
         self._heartbeat_interval = heartbeat_interval
         self._battery_interval = battery_interval
         self._next_battery_poll = None
+        self._last_control_diagnostic = 0.0
         self._reconnect_initial = reconnect_initial
         self._reconnect_max = reconnect_max
         self.battery = None
@@ -146,6 +149,22 @@ class TcpRobotBackend(Backend):
                     self._frame(3, command["x"], "steering"),
                     self._frame(1, command["y"], "throttle"),
                 )
+                now = time.monotonic()
+                if now - self._last_control_diagnostic >= self.CONTROL_DIAGNOSTIC_INTERVAL:
+                    logging.info(
+                        "runtime > TCP motor control robot=%s seat=%s "
+                        "steering=%.6f steering_multiplier=%.3f steering_frame=%s "
+                        "throttle=%.6f throttle_multiplier=%.3f throttle_frame=%s",
+                        self.robot_id,
+                        self.seat,
+                        float(command["x"]),
+                        self.MULTIPLIERS["steering"],
+                        frames[0].hex(),
+                        float(command["y"]),
+                        self.MULTIPLIERS["throttle"],
+                        frames[1].hex(),
+                    )
+                    self._last_control_diagnostic = now
             elif input_id in self.COMMANDS:
                 frames = (
                     self._frame(
@@ -331,4 +350,4 @@ class TcpRobotBackend(Backend):
         if not math.isfinite(value) or value < -1 or value > 1:
             raise ValueError("control value outside normalized range")
         scaled = value * cls.MULTIPLIERS[multiplier]
-        return bytes((command_id, int(100 + scaled * 100)))
+        return bytes((command_id, int(round(100 + scaled * 100))))
