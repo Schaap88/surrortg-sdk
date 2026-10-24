@@ -3,6 +3,8 @@ import logging
 import struct
 
 from surrortg import ConfigType
+from surrortg.device_identity import parse_device_identity_payload
+from surrortg.power_telemetry import parse_power_status_payload
 from surrortg.tcp_transport import BOT_TCP_PORT
 
 from .tcp_protocol import TcpCommandId, open_tcp_endpoint
@@ -211,27 +213,42 @@ class TcpBot:
             must take seat, cmd_id and cmd_val as parameters
         :type on_receive_cb: function
         """
-        """Handles BATTERY_STATUS (9 bytes) and other commands (2 bytes)"""
+        """Handle fixed SRTG responses without guessing unknown framing."""
         endpoint = self.endpoints[seat]
         try:
-                while True:
-                    # Read the command id (1 byte)
-                    cmd_id_raw = await endpoint.receive_exactly(1)
-                    cmd_id = struct.unpack("B", cmd_id_raw)[0]
+            while True:
+                cmd_id_raw = await endpoint.receive_exactly(1)
+                cmd_id = struct.unpack("B", cmd_id_raw)[0]
 
-                    if cmd_id == TcpCommandId.BATTERY_STATUS:
-                        # Now read 8 bytes for voltage + soc (two floats)
-                        data = await endpoint.receive_exactly(8)
-                        voltage, soc = struct.unpack("<ff", data)
-                        logging.debug(f"Got BATTERY_STATUS from seat {seat}: {voltage:.2f}V, {soc:.1f}%")
-                        
-                        # Pass it to your handle callback
-                        await on_receive_cb(seat, cmd_id, (voltage, soc))
-                    else:
-                        # Another command (1 byte more for cmd_val?)
-                        val_raw = await endpoint.receive_exactly(1)
-                        val = struct.unpack("B", val_raw)[0]
-                        logging.debug(f"Got cmd {cmd_id} val {val} from seat {seat}")
-                        await on_receive_cb(seat, cmd_id, val)
+                if cmd_id == TcpCommandId.BATTERY_STATUS:
+                    data = await endpoint.receive_exactly(8)
+                    voltage, soc = struct.unpack("<ff", data)
+                    logging.debug(
+                        "Got BATTERY_STATUS from seat %s: %.2fV, %.1f%%",
+                        seat,
+                        voltage,
+                        soc,
+                    )
+                    await on_receive_cb(seat, cmd_id, (voltage, soc))
+                elif cmd_id == TcpCommandId.POWER_STATUS:
+                    data = await endpoint.receive_exactly(19)
+                    await on_receive_cb(
+                        seat, cmd_id, parse_power_status_payload(data)
+                    )
+                elif cmd_id == TcpCommandId.DEVICE_IDENTITY:
+                    data = await endpoint.receive_exactly(7)
+                    await on_receive_cb(
+                        seat, cmd_id, parse_device_identity_payload(data)
+                    )
+                elif cmd_id == TcpCommandId.PING:
+                    val_raw = await endpoint.receive_exactly(1)
+                    val = struct.unpack("B", val_raw)[0]
+                    await on_receive_cb(seat, cmd_id, val)
+                else:
+                    raise ValueError(
+                        f"Unsupported response command {cmd_id}; closing "
+                        "to preserve stream framing"
+                    )
         except Exception as e:
             logging.error(f"Seat {seat} reading loop ended: {e}")
+            await endpoint.close()

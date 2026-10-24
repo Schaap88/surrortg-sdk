@@ -17,11 +17,17 @@ class FakeEsp32:
         close_after_ping=False,
         stall=False,
         battery=None,
+        power=None,
+        identity=None,
+        unknown_on_power=False,
     ):
         self.ping = ping
         self.close_after_ping = close_after_ping
         self.stall = stall
         self.battery = battery
+        self.power = power
+        self.identity = identity
+        self.unknown_on_power = unknown_on_power
         self.frames = []
         self.connections = 0
         self.server = None
@@ -46,6 +52,16 @@ class FakeEsp32:
                     writer.write(
                         bytes((100,)) + struct.pack("<ff", *self.battery)
                     )
+                    await writer.drain()
+                if frame == b"\x65\x00":
+                    if self.unknown_on_power:
+                        writer.write(b"\x99\x00garbage")
+                        await writer.drain()
+                    elif self.power is not None:
+                        writer.write(bytes((101,)) + self.power)
+                        await writer.drain()
+                if frame == b"\x66\x00" and self.identity is not None:
+                    writer.write(bytes((102, 1)) + self.identity)
                     await writer.drain()
                 if frame == b"\xc8\x00":
                     ping_count += 1
@@ -205,7 +221,9 @@ class TcpRobotBackendTest(unittest.IsolatedAsyncioTestCase):
             controls = [
                 frame
                 for frame in server.frames
-                if frame not in (b"\xc8\x00", b"\x64\x00")
+                if frame not in (
+                    b"\xc8\x00", b"\x64\x00", b"\x65\x00", b"\x66\x00"
+                )
             ]
             self.assertEqual(controls, [
                 b"\x03\x78", b"\x01\x00", b"\x05\x96", b"\x07\x32",
@@ -266,6 +284,59 @@ class TcpRobotBackendTest(unittest.IsolatedAsyncioTestCase):
             self.assertIn(b"\x64\x00", server.frames)
             self.assertAlmostEqual(backend.battery["voltage"], 7.4, places=4)
             self.assertAlmostEqual(backend.battery["soc"], 82.5, places=4)
+            await backend.stop()
+
+    async def test_identity_probe_is_optional_and_uses_canonical_station_mac(self):
+        async with FakeEsp32() as legacy:
+            backend = await self.configure(backend_for(legacy))
+            await backend.start()
+            self.assertTrue((await backend.status()).ready)
+            self.assertIsNone(backend.hardware_id)
+            await eventually(lambda: b"\x66\x00" in legacy.frames)
+            self.assertIn(b"\x66\x00", legacy.frames)
+            await backend.stop()
+
+        async with FakeEsp32(identity=bytes.fromhex("aabbcc010203")) as server:
+            backend = await self.configure(backend_for(server))
+            await backend.start()
+            await eventually(lambda: backend.hardware_id is not None)
+            self.assertEqual(backend.hardware_id, "aa:bb:cc:01:02:03")
+            self.assertNotEqual(backend.hardware_id, backend.robot_id)
+            await backend.stop()
+
+    async def test_power_response_preserves_signed_values_and_framing(self):
+        payload = struct.pack(
+            ">BBHHhiBHHH",
+            1, 0x1F, 4000, 5050, -500, -2000, 2, 12, 3, 0,
+        )
+        async with FakeEsp32(power=payload) as server:
+            backend = await self.configure(backend_for(server))
+            await backend.start()
+            await eventually(lambda: backend.power_status is not None)
+            status = backend.power_status
+            self.assertEqual(status.voltage_mv, 4000)
+            self.assertEqual(status.state_of_charge_percent, 50.5)
+            self.assertEqual(status.current_ma, -500)
+            self.assertEqual(status.power_mw, -2000)
+            self.assertEqual(status.fuel_gauge_age_ms, 1200)
+            self.assertTrue((await backend.status()).ready)
+            await backend.stop()
+
+    async def test_unknown_response_closes_stream_before_reconnect(self):
+        async with FakeEsp32(unknown_on_power=True) as server:
+            backend = await self.configure(backend_for(server))
+            await backend.start()
+            await eventually(lambda: server.connections >= 2, timeout=0.8)
+            self.assertGreaterEqual(server.connections, 2)
+            await backend.stop()
+
+    async def test_malformed_power_response_closes_stream(self):
+        malformed = b"\x02" + b"\x00" * 18
+        async with FakeEsp32(power=malformed) as server:
+            backend = await self.configure(backend_for(server))
+            await backend.start()
+            await eventually(lambda: server.connections >= 2, timeout=0.8)
+            self.assertIsNone(backend.power_status)
             await backend.stop()
 
     async def test_malformed_control_is_not_transmitted(self):

@@ -7,6 +7,9 @@ import time
 from copy import deepcopy
 from dataclasses import dataclass, field
 
+from surrortg.device_identity import parse_device_identity_payload
+from surrortg.power_telemetry import parse_power_status_payload
+
 
 @dataclass
 class BackendStatus:
@@ -63,6 +66,10 @@ class TcpRobotBackend(Backend):
     STOP = bytes((0xFF, 0))
     BATTERY_STATUS = 100
     BATTERY_REQUEST = bytes((BATTERY_STATUS, 0))
+    POWER_STATUS = 101
+    POWER_REQUEST = bytes((POWER_STATUS, 0))
+    DEVICE_IDENTITY = 102
+    IDENTITY_REQUEST = bytes((DEVICE_IDENTITY, 0))
     COMMANDS = {"lift": 5, "tilt": 7}
     MULTIPLIERS = {
         "steering": 0.2,
@@ -109,6 +116,9 @@ class TcpRobotBackend(Backend):
         self._reconnect_initial = reconnect_initial
         self._reconnect_max = reconnect_max
         self.battery = None
+        self.power_status = None
+        self.hardware_id = None
+        self._identity_pending = True
 
     async def apply_configuration(self, runtime_config: dict) -> None:
         await super().apply_configuration(runtime_config)
@@ -197,6 +207,8 @@ class TcpRobotBackend(Backend):
             )
             if response != self.PING:
                 raise ValueError("invalid PING response")
+            self.hardware_id = None
+            self._identity_pending = True
             self._next_battery_poll = (
                 asyncio.get_running_loop().time() + self._battery_interval
             )
@@ -234,8 +246,13 @@ class TcpRobotBackend(Backend):
                 await asyncio.sleep(self._heartbeat_interval)
                 now = asyncio.get_running_loop().time()
                 request = self.PING
+                if self._identity_pending:
+                    request = self.IDENTITY_REQUEST + request
+                    self._identity_pending = False
                 if now >= self._next_battery_poll:
-                    request = self.BATTERY_REQUEST + request
+                    request = (
+                        self.POWER_REQUEST + self.BATTERY_REQUEST + request
+                    )
                     self._next_battery_poll = now + self._battery_interval
                 if not await self._write(request):
                     continue
@@ -263,6 +280,22 @@ class TcpRobotBackend(Backend):
                     "soc": soc,
                 }
                 continue
+            if command_id == self.POWER_STATUS:
+                payload = await asyncio.wait_for(
+                    self._endpoint.receive_exactly(19), self._response_timeout
+                )
+                self.power_status = parse_power_status_payload(payload)
+                continue
+            if command_id == self.DEVICE_IDENTITY:
+                payload = await asyncio.wait_for(
+                    self._endpoint.receive_exactly(7), self._response_timeout
+                )
+                self.hardware_id = parse_device_identity_payload(payload)
+                continue
+            if command_id != self.PING[0]:
+                # An unknown command has unknown framing. Closing is the only
+                # safe way to guarantee it cannot desynchronize this stream.
+                raise ValueError(f"unsupported response command {command_id}")
             value = await asyncio.wait_for(
                 self._endpoint.receive_exactly(1), self._response_timeout
             )
