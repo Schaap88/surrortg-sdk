@@ -18,7 +18,6 @@ class TcpCommandId(IntEnum):
     CUSTOM_3_CAL = 10
     CUSTOM_4 = 11
     CUSTOM_4_CAL = 12
-    BATTERY_STATUS = 100
     POWER_STATUS = 101
     DEVICE_IDENTITY = 102
     PING = 200

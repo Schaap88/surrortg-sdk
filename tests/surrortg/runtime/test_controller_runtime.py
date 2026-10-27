@@ -115,6 +115,27 @@ class ControllerRuntimeTest(unittest.IsolatedAsyncioTestCase):
             "controller-a", emit, registry, clock=lambda: "2026-01-01T00:00:00Z"
         )
 
+    async def test_telemetry_is_published_outside_status_and_coalesced(self):
+        await self.runtime.apply_configuration(configure_command())
+        self.runtime._queue_telemetry("417", {
+            "kind": "identity", "hardware_mac": "aa:bb:cc:01:02:03",
+        })
+        self.runtime._queue_telemetry("417", {
+            "kind": "power", "power": {
+                "version": 1, "validity": 31, "voltage_mv": 4000,
+                "state_of_charge_percent": 50.5, "current_ma": -500,
+                "power_mw": -2000, "dock_state": "present",
+                "fuel_gauge_age_ms": 1000, "current_age_ms": 100,
+                "dock_age_ms": 0,
+            },
+        })
+        await self.runtime._telemetry_task
+        telemetry = [payload for event, payload in self.events if event == "robot.telemetry_observed"]
+        self.assertGreaterEqual(len(telemetry), 1)
+        self.assertEqual(telemetry[-1]["robot_id"], "417")
+        self.assertEqual(telemetry[-1]["power"]["current_ma"], -500)
+        self.assertEqual(telemetry[-1]["hardware_mac"], "aa:bb:cc:01:02:03")
+
     async def test_valid_config_applies_canonical_mapping_and_complete_snapshot(self):
         command = configure_command(
             [

@@ -220,17 +220,7 @@ class TcpBot:
                 cmd_id_raw = await endpoint.receive_exactly(1)
                 cmd_id = struct.unpack("B", cmd_id_raw)[0]
 
-                if cmd_id == TcpCommandId.BATTERY_STATUS:
-                    data = await endpoint.receive_exactly(8)
-                    voltage, soc = struct.unpack("<ff", data)
-                    logging.debug(
-                        "Got BATTERY_STATUS from seat %s: %.2fV, %.1f%%",
-                        seat,
-                        voltage,
-                        soc,
-                    )
-                    await on_receive_cb(seat, cmd_id, (voltage, soc))
-                elif cmd_id == TcpCommandId.POWER_STATUS:
+                if cmd_id == TcpCommandId.POWER_STATUS:
                     data = await endpoint.receive_exactly(19)
                     await on_receive_cb(
                         seat, cmd_id, parse_power_status_payload(data)

@@ -16,7 +16,6 @@ class FakeEsp32:
         ping=b"\xc8\x00",
         close_after_ping=False,
         stall=False,
-        battery=None,
         power=None,
         identity=None,
         unknown_on_power=False,
@@ -24,7 +23,6 @@ class FakeEsp32:
         self.ping = ping
         self.close_after_ping = close_after_ping
         self.stall = stall
-        self.battery = battery
         self.power = power
         self.identity = identity
         self.unknown_on_power = unknown_on_power
@@ -48,11 +46,6 @@ class FakeEsp32:
             while True:
                 frame = await reader.readexactly(2)
                 self.frames.append(frame)
-                if frame == b"\x64\x00" and self.battery is not None:
-                    writer.write(
-                        bytes((100,)) + struct.pack("<ff", *self.battery)
-                    )
-                    await writer.drain()
                 if frame == b"\x65\x00":
                     if self.unknown_on_power:
                         writer.write(b"\x99\x00garbage")
@@ -93,7 +86,7 @@ def backend_for(server, **options):
         connect_timeout=0.2,
         response_timeout=0.06,
         heartbeat_interval=0.03,
-        battery_interval=0.04,
+        telemetry_interval=0.04,
         reconnect_initial=0.01,
         reconnect_max=0.03,
         **options,
@@ -222,7 +215,7 @@ class TcpRobotBackendTest(unittest.IsolatedAsyncioTestCase):
                 frame
                 for frame in server.frames
                 if frame not in (
-                    b"\xc8\x00", b"\x64\x00", b"\x65\x00", b"\x66\x00"
+                    b"\xc8\x00", b"\x65\x00", b"\x66\x00"
                 )
             ]
             self.assertEqual(controls, [
@@ -275,17 +268,6 @@ class TcpRobotBackendTest(unittest.IsolatedAsyncioTestCase):
             }))
             await backend.stop()
 
-    async def test_battery_response_is_parsed_without_stealing_ping(self):
-        async with FakeEsp32(battery=(7.4, 82.5)) as server:
-            backend = await self.configure(backend_for(server))
-            await backend.start()
-            self.assertTrue((await backend.status()).ready)
-            await eventually(lambda: backend.battery is not None)
-            self.assertIn(b"\x64\x00", server.frames)
-            self.assertAlmostEqual(backend.battery["voltage"], 7.4, places=4)
-            self.assertAlmostEqual(backend.battery["soc"], 82.5, places=4)
-            await backend.stop()
-
     async def test_identity_probe_is_optional_and_uses_canonical_station_mac(self):
         async with FakeEsp32() as legacy:
             backend = await self.configure(backend_for(legacy))
@@ -311,6 +293,8 @@ class TcpRobotBackendTest(unittest.IsolatedAsyncioTestCase):
         )
         async with FakeEsp32(power=payload) as server:
             backend = await self.configure(backend_for(server))
+            observations = []
+            backend.subscribe_telemetry(observations.append)
             await backend.start()
             await eventually(lambda: backend.power_status is not None)
             status = backend.power_status
@@ -319,7 +303,29 @@ class TcpRobotBackendTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(status.current_ma, -500)
             self.assertEqual(status.power_mw, -2000)
             self.assertEqual(status.fuel_gauge_age_ms, 1200)
+            self.assertEqual(observations[-1]["power"]["current_ma"], -500)
+            self.assertEqual(observations[-1]["power"]["dock_state"], "present")
             self.assertTrue((await backend.status()).ready)
+            await backend.stop()
+
+    async def test_telemetry_publication_failure_does_not_block_control_or_stop(self):
+        payload = struct.pack(
+            ">BBHHhiBHHH",
+            1, 0x1F, 4000, 5050, 500, 2000, 1, 0, 0, 0,
+        )
+        async with FakeEsp32(power=payload) as server:
+            backend = await self.configure(backend_for(server))
+            backend.subscribe_telemetry(
+                lambda _value: (_ for _ in ()).throw(RuntimeError("offline"))
+            )
+            await backend.start()
+            await eventually(lambda: backend.power_status is not None)
+            self.assertTrue((await backend.status()).ready)
+            self.assertTrue(await backend.apply_control({
+                "id": "lift", "command": {"val": 0.5}
+            }))
+            self.assertEqual(await backend.neutralize(), "succeeded")
+            await eventually(lambda: b"\xff\x00" in server.frames)
             await backend.stop()
 
     async def test_unknown_response_closes_stream_before_reconnect(self):

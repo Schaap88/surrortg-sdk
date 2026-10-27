@@ -43,6 +43,9 @@ class ControllerRuntime:
         self._result_cache_ttl = result_cache_ttl
         self._peers = {}
         self._enabled_seats = set()
+        self._telemetry_pending = {}
+        self._telemetry_sequences = {}
+        self._telemetry_task = None
 
     async def _emit_world_snapshot(self, snapshot):
         await self._emit("simulation.world_snapshot", snapshot)
@@ -168,6 +171,7 @@ class ControllerRuntime:
         self._peers.clear()
         self._enabled_seats.clear()
         self.connection_epoch = None
+        self._telemetry_pending.clear()
 
     async def shutdown(self):
         """Fail safe and release all configured backends on orderly exit."""
@@ -292,6 +296,14 @@ class ControllerRuntime:
                     await self.update_robot_status(robot_id, status)
 
             backend.subscribe(observed)
+
+            def telemetry_observed(value, robot_id=robot_id, backend=backend):
+                if self.robots.get(robot_id, {}).get("backend") is backend and self.connection_epoch is not None:
+                    self._queue_telemetry(robot_id, value)
+
+            subscribe_telemetry = getattr(backend, "subscribe_telemetry", None)
+            if subscribe_telemetry:
+                subscribe_telemetry(telemetry_observed)
         for old in previous.values():
             await old["backend"].stop()
 
@@ -303,6 +315,44 @@ class ControllerRuntime:
         for robot_id, observation in self._observations.items():
             logging.info("runtime > Robot %s reachable=%s ready=%s", robot_id, observation["reachable"], observation["ready"])
         return True
+
+    def _queue_telemetry(self, robot_id, value):
+        """Coalesce observations per Robot without blocking control handling."""
+        pending = self._telemetry_pending.setdefault(str(robot_id), {})
+        kind = value.get("kind")
+        if kind == "identity":
+            pending["hardware_mac"] = value.get("hardware_mac")
+        elif kind == "power":
+            pending["power"] = value.get("power")
+        else:
+            return
+        if self._telemetry_task is None or self._telemetry_task.done():
+            self._telemetry_task = asyncio.create_task(self._flush_telemetry())
+
+    async def _flush_telemetry(self):
+        while self._telemetry_pending and self.connection_epoch is not None:
+            robot_id, values = self._telemetry_pending.popitem()
+            sequence = self._telemetry_sequences.get(robot_id, 0) + 1
+            self._telemetry_sequences[robot_id] = sequence
+            try:
+                await self._emit("robot.telemetry_observed", {
+                    "schema_version": 1,
+                    "game_id": self.game_id,
+                    "controller_id": self.controller_id,
+                    "connection_epoch": self.connection_epoch,
+                    "config_revision": self.applied_config_revision,
+                    "robot_id": robot_id,
+                    "seat": self.robots[robot_id]["seat"],
+                    "telemetry_seq": sequence,
+                    "observed_at": self._clock(),
+                    **values,
+                })
+            except Exception as error:
+                logging.warning(
+                    "runtime > Robot %s telemetry emit failed: %s",
+                    robot_id,
+                    type(error).__name__,
+                )
 
     async def update_robot_status(self, robot_id, status):
         robot_id = str(robot_id)

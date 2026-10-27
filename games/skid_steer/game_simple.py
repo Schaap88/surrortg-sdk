@@ -18,8 +18,6 @@ class SkidSimpleGame(Game):
         self.skid_steer = Skidsteer(self.io)
         self.io.register_inputs(self.skid_steer.inputs)
 
-        logging.info("Starting battery polling task.")
-        asyncio.create_task(self._poll_battery())
 
     async def on_pre_game(self):
         pass
@@ -29,16 +27,6 @@ class SkidSimpleGame(Game):
 
     async def on_start(self):
         pass
-
-    async def _poll_battery(self):
-        """Request battery status every 10 seconds and send it to the signaling server"""
-        while True:
-            for seat in self.skid_steer.endpoints:
-                # This just sends the request - response comes asynchronously
-                await self.skid_steer.request_battery_status(seat)
-                
-            # Data will be sent via _handle_battery_response when received
-            await asyncio.sleep(10)
 
     async def on_run(self):
         """Main game loop"""

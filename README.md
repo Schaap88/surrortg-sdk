@@ -2,15 +2,13 @@
 
 ## ESP32 power telemetry and identity
 
-The canonical TCP runtime understands the legacy nine-byte `BATTERY_STATUS`
-response (command 100) and the versioned 20-byte `POWER_STATUS` response
+The canonical TCP runtime uses the versioned 20-byte `POWER_STATUS` response
 (command 101). `PowerStatus` keeps invalid values as `None`, preserves signed
 mA/mW values, and exposes freshness ages in milliseconds.
 
 After the normal PING readiness check, the runtime probes command 102 during
 monitoring. Supporting ESP32 firmware returns its factory Wi-Fi station MAC;
-the SDK exposes it as lowercase colon-separated `hardware_id`. Older firmware
-ignores the probe and remains usable with `hardware_id = None`. This hardware
+the SDK exposes it as lowercase colon-separated `hardware_id`. This hardware
 identifier is distinct from Platform Robot IDs and TCP sessions and is not an
 authentication mechanism.
 

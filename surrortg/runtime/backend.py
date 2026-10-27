@@ -6,6 +6,7 @@ import struct
 import time
 from copy import deepcopy
 from dataclasses import dataclass, field
+from dataclasses import asdict
 
 from surrortg.device_identity import parse_device_identity_payload
 from surrortg.power_telemetry import parse_power_status_payload
@@ -64,8 +65,6 @@ class TcpRobotBackend(Backend):
 
     PING = bytes((200, 0))
     STOP = bytes((0xFF, 0))
-    BATTERY_STATUS = 100
-    BATTERY_REQUEST = bytes((BATTERY_STATUS, 0))
     POWER_STATUS = 101
     POWER_REQUEST = bytes((POWER_STATUS, 0))
     DEVICE_IDENTITY = 102
@@ -88,7 +87,7 @@ class TcpRobotBackend(Backend):
         connect_timeout=5,
         response_timeout=2,
         heartbeat_interval=2,
-        battery_interval=10,
+        telemetry_interval=10,
         reconnect_initial=0.1,
         reconnect_max=5,
     ):
@@ -110,15 +109,19 @@ class TcpRobotBackend(Backend):
         self._connect_timeout = connect_timeout
         self._response_timeout = response_timeout
         self._heartbeat_interval = heartbeat_interval
-        self._battery_interval = battery_interval
-        self._next_battery_poll = None
+        self._telemetry_interval = telemetry_interval
+        self._next_telemetry_poll = None
         self._last_control_diagnostic = 0.0
         self._reconnect_initial = reconnect_initial
         self._reconnect_max = reconnect_max
-        self.battery = None
         self.power_status = None
         self.hardware_id = None
         self._identity_pending = True
+        self._telemetry_callback = None
+
+    def subscribe_telemetry(self, callback) -> None:
+        """Subscribe to low-priority normalized hardware observations."""
+        self._telemetry_callback = callback
 
     async def apply_configuration(self, runtime_config: dict) -> None:
         await super().apply_configuration(runtime_config)
@@ -209,8 +212,8 @@ class TcpRobotBackend(Backend):
                 raise ValueError("invalid PING response")
             self.hardware_id = None
             self._identity_pending = True
-            self._next_battery_poll = (
-                asyncio.get_running_loop().time() + self._battery_interval
+            self._next_telemetry_poll = (
+                asyncio.get_running_loop().time() + self._telemetry_interval
             )
             await self._set_status(True, True)
             return True
@@ -249,11 +252,9 @@ class TcpRobotBackend(Backend):
                 if self._identity_pending:
                     request = self.IDENTITY_REQUEST + request
                     self._identity_pending = False
-                if now >= self._next_battery_poll:
-                    request = (
-                        self.POWER_REQUEST + self.BATTERY_REQUEST + request
-                    )
-                    self._next_battery_poll = now + self._battery_interval
+                if now >= self._next_telemetry_poll:
+                    request = self.POWER_REQUEST + request
+                    self._next_telemetry_poll = now + self._telemetry_interval
                 if not await self._write(request):
                     continue
                 await self._read_until_ping()
@@ -268,29 +269,29 @@ class TcpRobotBackend(Backend):
                 self._endpoint.receive_exactly(1), self._response_timeout
             )
             command_id = command[0]
-            if command_id == self.BATTERY_STATUS:
-                payload = await asyncio.wait_for(
-                    self._endpoint.receive_exactly(8), self._response_timeout
-                )
-                voltage, soc = struct.unpack("<ff", payload)
-                if not (math.isfinite(voltage) and math.isfinite(soc)):
-                    raise ValueError("malformed battery response")
-                self.battery = {
-                    "voltage": voltage,
-                    "soc": soc,
-                }
-                continue
             if command_id == self.POWER_STATUS:
                 payload = await asyncio.wait_for(
                     self._endpoint.receive_exactly(19), self._response_timeout
                 )
                 self.power_status = parse_power_status_payload(payload)
+                self._publish_telemetry({
+                    "kind": "power",
+                    "power": {
+                        **asdict(self.power_status),
+                        "validity": int(self.power_status.validity),
+                        "dock_state": self.power_status.dock_state.name.lower(),
+                    },
+                })
                 continue
             if command_id == self.DEVICE_IDENTITY:
                 payload = await asyncio.wait_for(
                     self._endpoint.receive_exactly(7), self._response_timeout
                 )
                 self.hardware_id = parse_device_identity_payload(payload)
+                self._publish_telemetry({
+                    "kind": "identity",
+                    "hardware_mac": self.hardware_id,
+                })
                 continue
             if command_id != self.PING[0]:
                 # An unknown command has unknown framing. Closing is the only
@@ -302,6 +303,31 @@ class TcpRobotBackend(Backend):
             if command_id != self.PING[0] or value != self.PING[1:]:
                 raise ValueError("invalid PING response")
             return
+
+    def _publish_telemetry(self, observation):
+        callback = self._telemetry_callback
+        if callback is None:
+            return
+        try:
+            result = callback(deepcopy(observation))
+        except Exception as error:
+            logging.warning(
+                "runtime > Robot %s telemetry publication failed: %s",
+                self.robot_id,
+                self._exception_diagnostic(error),
+            )
+            return
+        if asyncio.iscoroutine(result):
+            async def publish():
+                try:
+                    await result
+                except Exception as error:
+                    logging.warning(
+                        "runtime > Robot %s telemetry publication failed: %s",
+                        self.robot_id,
+                        self._exception_diagnostic(error),
+                    )
+            asyncio.create_task(publish())
 
     async def _write(self, data, mark_failed=True):
         endpoint = self._endpoint
