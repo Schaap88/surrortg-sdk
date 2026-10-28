@@ -1,4 +1,4 @@
-# B4 seeded local fixtures only. Run with games.dummy_game.game; no media/hardware.
+# Seeded Skid Steer Open World fixtures. The physical Robot remains optional.
 device_id = "dev-controller-001"
 
 [game_engine]

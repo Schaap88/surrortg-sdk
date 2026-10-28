@@ -2,7 +2,9 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import time
+import uuid
 from datetime import datetime, timezone
 
 from .backend import BackendStatus
@@ -46,11 +48,22 @@ class ControllerRuntime:
         self._telemetry_pending = {}
         self._telemetry_sequences = {}
         self._telemetry_task = None
+        self._gameplay_bindings = {}
+        self._gameplay_pending = {}
+        self._gameplay_task = None
+        self._development_completed = set()
 
     async def _emit_world_snapshot(self, snapshot):
         await self._emit("simulation.world_snapshot", snapshot)
 
     async def handle_message(self, message):
+        if message.event == 'gameplay.ack' and message.src == 'gameEngine':
+            payload = message.payload or {}
+            if payload.get('status') in {'accepted', 'completed', 'rejected'}:
+                self._gameplay_pending.pop(payload.get('event_id'), None)
+                if payload.get('status') == 'rejected':
+                    logging.warning('runtime > Objective rejected event_id=%s', payload.get('event_id'))
+            return True
         if message.event in {"newPeer", "peerLeft", "enableRouting", "disableRouting", "gameControls"}:
             return await self._handle_controls(message)
         if message.event == CONFIGURE:
@@ -79,14 +92,23 @@ class ControllerRuntime:
             robot_id = self.robot_id_for_seat(seat)
             if robot_id is None:
                 return False
-            return await self.robots[robot_id]["backend"].apply_control(payload)
+            applied = await self.robots[robot_id]["backend"].apply_control(payload)
+            self.development_complete_objective(seat)
+            return applied
         if message.src != "gameEngine":
             return False
         if message.event == "newPeer" and payload.get("seat") in self.seats:
             self._peers[payload["id"]] = payload["seat"]
+            if (isinstance(payload.get('session_id'), str) and payload['session_id'] and
+                    payload.get('session_id') == payload.get('allocation_id') and
+                    str(payload.get('robot_id')) == self.robot_id_for_seat(payload['seat'])):
+                self._gameplay_bindings[payload['seat']] = dict(payload)
         elif message.event == "peerLeft":
             seat = self._peers.pop(payload.get("id"), None)
             if seat is not None:
+                binding = self._gameplay_bindings.pop(seat, None)
+                if binding:
+                    self._development_completed.discard(binding['session_id'])
                 await self._neutralize_seats((seat,))
         elif message.event == "enableRouting":
             self._enabled_seats.update([payload["seat"]] if "seat" in payload else self.seats)
@@ -95,6 +117,54 @@ class ControllerRuntime:
             self._enabled_seats.difference_update(seats)
             await self._neutralize_seats(seats)
         return True
+
+    def objective_completed(self, seat, objective_key):
+        """Enqueue a trusted SDK objective observation; never called by player input."""
+        binding = self._gameplay_bindings.get(seat)
+        if not binding or seat not in self._enabled_seats or not self.connection_epoch:
+            return None
+        event_id = str(uuid.uuid4())
+        self._gameplay_pending[event_id] = {
+            'schema_version': 1, 'type': 'objective_completed', 'event_id': event_id,
+            'objective_key': objective_key, 'game_id': self.game_id,
+            'controller_id': self.controller_id, 'connection_epoch': self.connection_epoch,
+            'config_revision': self.applied_config_revision, 'robot_id': str(binding['robot_id']),
+            'session_id': binding['session_id'], 'allocation_id': binding['allocation_id'],
+            'occurred_at': self._clock(),
+        }
+        if self._gameplay_task is None or self._gameplay_task.done():
+            self._gameplay_task = asyncio.create_task(self._deliver_objectives())
+        return event_id
+
+    def development_complete_objective(self, seat):
+        """Opt-in simulated construction task for local end-to-end development."""
+        binding = self._gameplay_bindings.get(seat)
+        robot = self.robots.get(self.robot_id_for_seat(seat), {})
+        if (os.environ.get('GROUNDBREAKING_DEV_COMPLETE_OBJECTIVE') != '1' or
+                robot.get('implementation_kind') != 'simulated' or not binding or
+                binding['session_id'] in self._development_completed):
+            return None
+        event_id = self.objective_completed(seat, 'first_construction_task')
+        if event_id:
+            self._development_completed.add(binding['session_id'])
+            logging.info('runtime > Development objective queued event_id=%s session_id=%s', event_id, binding['session_id'])
+        return event_id
+
+    async def _deliver_objectives(self):
+        deadline = time.monotonic() + 30
+        while self._gameplay_pending and time.monotonic() < deadline:
+            for event_id, payload in list(self._gameplay_pending.items()):
+                if payload['connection_epoch'] != self.connection_epoch:
+                    self._gameplay_pending.pop(event_id, None)
+                    continue
+                try:
+                    await asyncio.wait_for(self._emit('objective_completed', payload), 2)
+                except Exception as error:
+                    logging.warning('runtime > Objective delivery failed: %s', type(error).__name__)
+            await asyncio.sleep(.5)
+        for event_id in self._gameplay_pending:
+            logging.warning('runtime > Objective delivery expired event_id=%s', event_id)
+        self._gameplay_pending.clear()
 
     async def confirm_readiness(self, command):
         valid = self._valid_robot_command(command) and command.get("reservation_id")
@@ -169,12 +239,17 @@ class ControllerRuntime:
             observation["reachable"] = False
             observation["ready"] = False
         self._peers.clear()
+        self._gameplay_bindings.clear()
+        self._gameplay_pending.clear()
+        self._development_completed.clear()
         self._enabled_seats.clear()
         self.connection_epoch = None
         self._telemetry_pending.clear()
 
     async def shutdown(self):
         """Fail safe and release all configured backends on orderly exit."""
+        if self._gameplay_task:
+            self._gameplay_task.cancel()
         await self._neutralize_seats(tuple(self.seats))
         for robot in self.robots.values():
             await robot["backend"].stop()
@@ -276,6 +351,8 @@ class ControllerRuntime:
         previous = self.robots
         self.robots = candidates
         self._peers.clear()
+        self._gameplay_bindings.clear()
+        self._gameplay_pending.clear()
         self._enabled_seats.clear()
         self.seats = {robot["seat"]: robot_id for robot_id, robot in candidates.items()}
         self.game_id = str(command["game_id"])

@@ -2,10 +2,19 @@ import unittest
 from pathlib import Path
 
 from surrortg import get_config
+from surrortg.game import Game
 from surrortg.runtime import BackendRegistry
+from games.skid_steer.open_world import SkidSteerOpenWorldGame
 
 
 class DevelopmentBootstrapTest(unittest.IsolatedAsyncioTestCase):
+    def test_skid_steer_open_world_uses_current_game_runtime(self):
+        self.assertTrue(issubclass(SkidSteerOpenWorldGame, Game))
+        self.assertEqual(
+            SkidSteerOpenWorldGame.on_init.__qualname__,
+            'SkidSteerOpenWorldGame.on_init',
+        )
+
     def test_local_configuration_uses_current_admission_identity(self):
         root = Path(__file__).resolve().parents[3]
         config = get_config(str(root / 'configs/development/srtg.example.toml'))

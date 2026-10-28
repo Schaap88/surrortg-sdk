@@ -1,8 +1,8 @@
-"""Live seeded vertical slice. Requires running Platform, MySQL and Redis.
+"""Authenticated gameplay vertical slice using real local services.
 
-Run from the SDK: .venv/bin/python scripts/verify_simulated_runtime.py
-Starts temporary real Signaling and DummyGame processes; uses ordinary player
-Socket.IO messages. Assertions inspect their normal logs, with no control bypass.
+Requires running Platform (port 8000), MySQL, Redis, migrations, and
+GameplayMissionSeeder. Restores temporary Robot/availability changes. Keeps
+verification players and their session/ledger records as evidence.
 """
 import argparse
 import asyncio
@@ -11,200 +11,215 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+import uuid
+from urllib.parse import unquote
 
 import aiohttp
 import socketio
 from controller_admission import development_runtime_config
 
 
+# Verification-only instrumentation of the actual SDK runtime. Send duplicates
+# from the authenticated Controller, including after its allocation is released.
+CONTROLLER = r'''
+import asyncio, json, logging, os, uuid
+from games.skid_steer.open_world import SkidSteerOpenWorldGame
+class VerificationGame(SkidSteerOpenWorldGame):
+    async def on_init(self):
+        await super().on_init()
+        runtime = self.io.controller_runtime
+        original = runtime._emit
+        async def emit(event, payload):
+            await original(event, payload)
+            if event == 'objective_completed' and not getattr(self, 'captured', False):
+                self.captured = True
+                with open(os.environ['GAMEPLAY_EVIDENCE'], 'w') as f:
+                    json.dump(payload, f)
+                await original(event, payload)
+                async def delayed():
+                    while any(b['session_id'] == payload['session_id'] for b in runtime._gameplay_bindings.values()):
+                        await asyncio.sleep(.05)
+                    await original(event, payload)
+                    await original(event, {**payload, 'event_id': str(uuid.uuid4())})
+                    logging.info('verification > delayed Controller events emitted')
+                asyncio.create_task(delayed())
+        runtime._emit = emit
+VerificationGame().run(config_path=os.environ['VERIFICATION_CONFIG'])
+'''
+
+
 async def verify(port, output_dir):
     sdk = Path(__file__).resolve().parents[1]
-    signaling = sdk.parent / "groundbreaking-signaling"
+    platform = sdk.parent / 'groundbreaking-platform'
+    signaling = sdk.parent / 'groundbreaking-signaling'
     output_dir.mkdir(parents=True, exist_ok=True)
-    async with aiohttp.ClientSession() as session:
-        async def get(path):
-            async with session.get(f"http://127.0.0.1:8000/api/ge/v2/{path}") as response:
-                response.raise_for_status()
-                return await response.json()
+    base = 'http://127.0.0.1:8000'
+    logs = {'signaling': [], 'sdk': []}
+    processes, readers, clients, browsers, checks = [], [], [], [], []
+    fixture = None
 
-        config = await development_runtime_config(session)
-        domain = await get(f"games/{config['game_id']}/runtime-domain")
-    async def platform_eval(code, *arguments):
-        bootstrap = "require 'vendor/autoload.php'; $app = require 'bootstrap/app.php'; $app->make(Illuminate\\Contracts\\Console\\Kernel::class)->bootstrap(); "
-        process = await asyncio.create_subprocess_exec("php", "-r", bootstrap + code, *map(str, arguments),
-            cwd=sdk.parent / "groundbreaking-platform", stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-        stdout, stderr = await process.communicate()
-        if process.returncode:
+    async def php(code, *args):
+        bootstrap = "require 'vendor/autoload.php'; $app = require 'bootstrap/app.php'; $app->make(Illuminate\\Contracts\\Console\\Kernel::class)->bootstrap(); if (!app()->isLocal()) throw new RuntimeException('Local verification only'); "
+        p = await asyncio.create_subprocess_exec('php', '-r', bootstrap + code, *map(str, args), cwd=platform,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        stdout, stderr = await p.communicate()
+        if p.returncode:
             raise RuntimeError(stderr.decode())
         return stdout.decode()
 
-    original_desired = domain["desired_availability"]
-    async def desired(state):
-        await platform_eval("App\\Models\\Game::findOrFail($argv[1])->update(['desired_availability' => $argv[2]]);", config["game_id"], state)
-
-    simulated = next(r for r in config["robots"] if r["implementation_kind"] == "simulated")
-    physical = next(r for r in config["robots"] if r["implementation_kind"] == "physical")
-    assert simulated["runtime_config"] == {}
-    robot_domain = next(r for r in domain["robots"] if r["robot_id"] == simulated["robot_id"])
-    assert robot_domain["enabled"] and robot_domain["set_is_eligible"]
-    assert not next(r for r in domain["robots"] if r["robot_id"] == physical["robot_id"])["enabled"]
-    option = next(q for q in domain["queue_options"] if q["name"] == "Standard")
-    assert option["robot_type_id"] == robot_domain["robot_type_id"]
-    (output_dir / "domain.json").write_text(json.dumps({"config": config, "domain": domain}, indent=2))
-    config_path = output_dir / "srtg.toml"
-    config_path.write_text((sdk / "configs/development/srtg.example.toml").read_text().replace(":3000/", f":{port}/"))
-    logs = {"signaling": [], "sdk": []}
-    processes, readers, clients = [], [], []
-
-    async def capture(process, name):
-        with (output_dir / f"{name}.log").open("w") as file:
-            while line := await process.stdout.readline():
-                text = line.decode(errors="replace")
-                logs[name].append(text)
-                file.write(text)
-                file.flush()
-
-    async def wait_for(predicate, label):
-        async with asyncio.timeout(20):
+    async def wait(predicate, label):
+        async with asyncio.timeout(30):
             while not predicate():
-                for process in processes:
-                    if process.returncode is not None:
-                        raise RuntimeError(f"Process exited {process.returncode}; see {output_dir}")
+                if any(p.returncode is not None for p in processes):
+                    raise RuntimeError(f'Process exited; see {output_dir}')
                 await asyncio.sleep(.05)
+        checks.append(label)
         print(label, flush=True)
 
-    def has(name, text):
-        return any(text in line for line in logs[name])
+    def has(name, value):
+        return value in ''.join(logs[name])
+
+    async def capture(p, name):
+        with (output_dir / f'{name}.log').open('w') as f:
+            while line := await p.stdout.readline():
+                value = line.decode(errors='replace')
+                logs[name].append(value)
+                f.write(value)
+                f.flush()
 
     async def launch(name, *args, cwd, env):
-        process = await asyncio.create_subprocess_exec(*args, cwd=cwd, env=env,
+        p = await asyncio.create_subprocess_exec(*args, cwd=cwd, env=env,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
-        processes.append(process)
-        readers.append(asyncio.create_task(capture(process, name)))
+        processes.append(p)
+        readers.append(asyncio.create_task(capture(p, name)))
+
+    async def send(client, event, payload=None):
+        await client.emit('message', {'event': event, 'dst': 'forged-controller' if event == 'gameControls' else 'gameEngine',
+                                     'seat': 99, 'payload': payload or {}}, namespace='/signaling')
 
     async def player():
-        client = socketio.AsyncClient()
+        email, password = f'gameplay-{uuid.uuid4().hex}@groundbreaking.test', uuid.uuid4().hex
+        user_id = await php("$u = App\\Models\\User::forceCreate(['name' => 'Gameplay verifier', 'email' => $argv[1], 'password' => Illuminate\\Support\\Facades\\Hash::make($argv[2]), 'email_verified_at' => now(), 'inventory' => ['fuel' => 100, 'gold' => 0, 'special_items' => []]]); echo $u->id;", email, password)
+        browser = aiohttp.ClientSession(cookie_jar=aiohttp.CookieJar(unsafe=True),
+                                        headers={'Accept': 'application/json', 'Origin': base, 'Referer': base + '/'})
+        browsers.append(browser)
+        async def csrf():
+            async with browser.get(base + '/sanctum/csrf-cookie') as response:
+                response.raise_for_status()
+            browser.headers['X-XSRF-TOKEN'] = unquote(next(c.value for c in browser.cookie_jar if c.key == 'XSRF-TOKEN'))
+        await csrf()
+        async with browser.post(base + '/login', json={'email': email, 'password': password}, allow_redirects=False) as response:
+            assert response.status in (200, 204, 302), (response.status, await response.text())
+        await csrf()
+        async with browser.post(base + f"/games/{config['game_id']}/player-socket-token") as response:
+            response.raise_for_status()
+            token = (await response.json())['token']
+        client, messages = socketio.AsyncClient(), []
         clients.append(client)
-        messages = []
-
-        @client.on("message", namespace="/signaling")
+        @client.on('message', namespace='/signaling')
         async def receive(message):
             messages.append(message)
+        await client.connect(f"http://127.0.0.1:{port}?clientType=player&gameId={config['game_id']}", auth={'token': token}, namespaces=['/signaling'])
+        return client, messages, browser, user_id
 
-        @client.on("mappingResponse", namespace="/signaling")
-        async def receive_mapping(data):
-            messages.append({"event": "mappingResponse", "payload": json.loads(data) if isinstance(data, str) else data})
-
-        await client.connect(f"http://127.0.0.1:{port}?clientType=player&gameId={config['game_id']}", namespaces=["/signaling"])
-        return client, messages
-
-    async def send(client, event, *, dst="gameEngine", payload=None, seat=0):
-        await client.emit("message", {"event": event, "dst": dst, "seat": seat, "payload": payload or {}, "isAdmin": False}, namespace="/signaling")
-
-    def control_count():
-        return sum("control applied outputs=" in line for line in logs["sdk"])
-
-    def allocation_count():
-        return sum("readiness confirmed allocation=" in line for line in logs["signaling"])
+    def lifecycle(messages, state):
+        return next((m['payload'] for m in messages if m.get('event') == 'player.lifecycle' and m['payload']['state'] == state), None)
 
     try:
-        await desired("OPEN")
-        await launch("signaling", "node", "index.js", cwd=signaling, env={**os.environ,
-            "API_BASE_URL": "http://127.0.0.1:8000/api", "REDIS_URL": "redis://127.0.0.1:6379",
-            "SOCKETIO_PORT": str(port), "LOG_LEVEL": "debug"})
-        await wait_for(lambda: has("signaling", f"Listening on {port}"), "Real Signaling + Redis ready")
-        a, am = await player()
-        b, bm = await player()
-        await launch("sdk", sys.executable, "-m", "games.dummy_game.game", "-c", str(config_path), cwd=sdk,
-            env={**os.environ, "PYTHONPATH": str(sdk), "PYTHONUNBUFFERED": "1"})
-        await wait_for(lambda: has("signaling", "state=READY") and has("signaling", f"Robot={simulated['robot_id']} reachable=true ready=true eligible=true"),
-            "Configuration applied; snapshot accepted; Controller READY; simulated Robot eligible")
-        await desired("CLOSED")
-        await wait_for(lambda: has("signaling", "RuntimeGame CLOSED"), "Persistent close observed; effective CLOSED")
-        await send(a, "joinGame", payload={"queue_option_id": option["id"]})
-        await wait_for(lambda: any(m.get("event") == "joinGameResult" and m["payload"].get("reason") == "game_closed" for m in am), "CLOSED explicitly rejects gameplay")
-        assert allocation_count() == 0
-        await desired("OPEN")
-        await wait_for(lambda: sum("RuntimeGame OPEN" in line for line in logs["signaling"]) >= 2, "Persistent open observed")
-        control = {"id": "joystick_main", "type": "joystick", "command": {"x": .5, "y": -.75}}
-        await send(a, "gameControls", dst="dev-controller-001", payload=control)
-        await asyncio.sleep(.3)
-        assert control_count() == 0, "Unallocated control delivered"
-        await send(a, "joinGame", payload={"queue_option_id": option["id"]})
-        aid = a.get_sid("/signaling")
-        await wait_for(lambda: allocation_count() == 1 and any(m.get("event") == "enableRouting" for m in am), "Standard reserved, readiness confirmed, allocation committed")
-        assert any(m.get("event") == "newPeer" and m["payload"]["id"] == aid and m["payload"]["seat"] == simulated["seat"] for m in am)
-        await send(b, "gameControls", dst="dev-controller-001", payload=control, seat=simulated["seat"])
-        await asyncio.sleep(.3)
-        assert control_count() == 0, "Another player controlled allocated Robot"
-        # Supplied destination/seat are overwritten by canonical allocation.
-        await send(a, "gameControls", dst="arbitrary-controller", payload=control, seat=99)
-        await wait_for(lambda: control_count() == 1, "Player A control reached simulated backend through canonical allocation")
-        assert has("sdk", "'x': 0.5, 'y': -0.75")
-        await send(b, "joinGame", payload={"queue_option_id": option["id"]})
-        await wait_for(lambda: any(m.get("event") == "joinGameResult" and m["payload"].get("status") == "queued" for m in bm), "Player B queued")
-        await desired("CLOSED")
-        await wait_for(lambda: sum("RuntimeGame CLOSING" in line for line in logs["signaling"]) >= 2, "Graceful close enters CLOSING")
-        await a.emit("mapping", namespace="/signaling")
-        await wait_for(lambda: any(m.get("event") == "mappingResponse" and any(g["game_id"] == config["game_id"] and g["effective_availability"] == "CLOSING" for g in m["payload"].get("games", [])) for m in am), "Existing mapping boundary exposes effective CLOSING separately from desired CLOSED")
-        await send(a, "gameControls", dst="dev-controller-001", payload=control)
-        await wait_for(lambda: control_count() == 2, "Committed Player A continues during CLOSING")
-        c, cm = await player()
-        await send(c, "joinGame", payload={"queue_option_id": option["id"]})
-        await wait_for(lambda: any(m.get("event") == "joinGameResult" and m["payload"].get("reason") == "game_closing" for m in cm), "CLOSING rejects new admission")
-        assert allocation_count() == 1
-        await send(a, "leaveGame")
-        await wait_for(lambda: has("sdk", "neutralization succeeded outputs={'joystick_main': {'x': 0, 'y': 0}}") and
-            has("signaling", f"neutralization succeeded Robot={simulated['robot_id']} eligible=true"), "Released; correlated neutralization succeeded; outputs neutral; Robot eligible again")
-        await send(a, "gameControls", dst="dev-controller-001", payload=control)
-        await asyncio.sleep(.3)
-        assert control_count() == 2, "Released player still controls Robot"
-        await wait_for(lambda: sum("RuntimeGame CLOSED" in line for line in logs["signaling"]) >= 2, "Drain completed synchronously; effective CLOSED")
-        await asyncio.sleep(1.2)
-        assert allocation_count() == 1, "Dormant queue advanced while CLOSED"
-        await desired("OPEN")
-        await wait_for(lambda: allocation_count() == 2 and sum(m.get("event") == "enableRouting" for m in bm) == 2, "Second allocation succeeded without restarting Controller")
-        await send(b, "gameControls", dst="dev-controller-001", payload=control)
-        await wait_for(lambda: control_count() == 3, "Player B control reached same simulated Robot")
-        await send(b, "leaveGame")
-        await wait_for(lambda: sum("neutralization succeeded Robot=" in line for line in logs["signaling"]) == 2, "Second release neutralized successfully")
-        assert sum("configuration applied revision=" in line for line in logs["sdk"]) == 1
-        history = None
-        for _ in range(100):
-            raw = await platform_eval("echo App\\Models\\PlayerSession::where('runtime_player_id', $argv[1])->first()?->toJson() ?? 'null';", aid)
-            history = json.loads(raw)
-            if history and history["ended_at"]:
-                break
-            await asyncio.sleep(.1)
-        assert history and history["allocated_at"] and history["started_at"] and history["ended_at"]
-        assert str(history["game_id"]) == config["game_id"] and str(history["robot_id"]) == simulated["robot_id"]
-        assert str(history["queue_option_id"]) == option["id"] and history["end_reason"] == "player_left"
-        (output_dir / "player-session.json").write_text(json.dumps(history, indent=2))
-        print("Historical session has truthful canonical IDs, allocation/start/end timestamps and reason", flush=True)
-        result = {"status": "passed", "game_id": config["game_id"], "queue_option_id": option["id"],
-            "robot_id": simulated["robot_id"], "controller_id": config["controller_id"], "seat": simulated["seat"],
-            "allocations": 2, "controls": 3, "neutralizations": 2}
-        (output_dir / "result.json").write_text(json.dumps(result, indent=2))
-        print(f"PASS; evidence: {output_dir}")
+        async with aiohttp.ClientSession() as http:
+            config = await development_runtime_config(http)
+            async with http.get(base + f"/api/ge/v2/games/{config['game_id']}/runtime-domain") as response:
+                response.raise_for_status()
+                domain = await response.json()
+        option = next(q for q in domain['queue_options'] if q['name'] == 'Standard')
+        simulated = next(r for r in config['robots'] if r['implementation_kind'] == 'simulated')
+        fixture = json.loads(await php("$g = App\\Models\\Game::findOrFail($argv[1]); echo json_encode(['game' => $g->only(['desired_availability', 'pause_requested']), 'robots' => $g->controllers->flatMap->robots->map(fn($r) => ['id' => $r->id, 'enabled' => $r->enabled, 'custom' => $r->custom])->values()]);", config['game_id']))
+        # A single simulated Robot forces queueing; physical backends point at
+        # loopback for this run so no physical equipment is contacted.
+        await php("$g = App\\Models\\Game::findOrFail($argv[1]); $g->update(['desired_availability' => 'OPEN', 'pause_requested' => false]); foreach ($g->controllers->flatMap->robots as $r) { $r->enabled = (string)$r->id === $argv[2]; if ($r->implementation_kind === 'physical') $r->custom = [['name' => 'address', 'value' => '127.0.0.1']]; $r->save(); }", config['game_id'], simulated['robot_id'])
+        private = json.loads(await php("echo json_encode(['runtime' => config('services.signaling_runtime.token'), 'player' => config('services.player_socket.secret')]);"))
+        assert private['runtime'] and private['player'], 'Configure shared runtime/player secrets first'
+        config_path = output_dir / 'srtg.toml'
+        config_path.write_text((sdk / 'configs/development/srtg.example.toml').read_text().replace(':3000/', f':{port}/'))
+        await launch('signaling', 'node', 'index.js', cwd=signaling, env={**os.environ,
+            'API_BASE_URL': base + '/api', 'REDIS_URL': 'redis://127.0.0.1:6379', 'SOCKETIO_PORT': str(port),
+            'LOG_LEVEL': 'debug', 'PLATFORM_RUNTIME_COMMAND_TOKEN': private['runtime'],
+            'PLAYER_SOCKET_JWT_SECRET': private['player'], 'RUNTIME_JOURNAL_DIR': str(output_dir / 'journal')})
+        await wait(lambda: has('signaling', f'Listening on {port}'), 'Real Signaling and Redis ready')
+        a, am, browser, user_id = await player()
+        b, bm, _, _ = await player()
+        await send(a, 'joinGame', {'queue_option_id': option['id']})
+        await wait(lambda: lifecycle(am, 'QUEUED'), 'Authenticated player joins Skid Steer Open World and enters queue')
+        await launch('sdk', sys.executable, '-c', CONTROLLER, cwd=sdk, env={**os.environ, 'PYTHONPATH': str(sdk),
+            'PYTHONUNBUFFERED': '1', 'VERIFICATION_CONFIG': str(config_path),
+            'GROUNDBREAKING_DEV_COMPLETE_OBJECTIVE': '1', 'GAMEPLAY_EVIDENCE': str(output_dir / 'event.json'),
+            'SURRORTG_MANAGEMENT_SOCKET': str(output_dir / 'controller.sock')})
+        await wait(lambda: lifecycle(am, 'ALLOCATED'), 'Robot reserved and readiness confirmed; player receives control')
+        allocation = lifecycle(am, 'ALLOCATED')
+        session_id = allocation['session_id']
+        await send(b, 'joinGame', {'queue_option_id': option['id']})
+        await wait(lambda: lifecycle(bm, 'QUEUED'), 'Second authenticated player queues behind allocated Robot')
+        await send(a, 'gameControls', {'id': 'joystick_main', 'type': 'joystick', 'command': {'x': .5, 'y': -.75}})
+        await wait(lambda: lifecycle(am, 'ACTIVE') and has('sdk', 'control applied outputs='), 'Player Session starts and control reaches simulated backend')
+        await wait(lambda: any(m.get('event') == 'gameplay.result' for m in am), 'SDK objective reaches Platform through Signaling; feedback reaches player')
+        receipt = next(m['payload'] for m in am if m.get('event') == 'gameplay.result')
+        assert receipt['status'] == 'completed' and receipt['reward']['gold'] == 25
+        assert receipt['session_id'] == session_id and receipt['objective_key'] == 'first_construction_task'
+        assert receipt['objective'] == 'Complete your first construction task.'
+        await wait(lambda: sum('status: "completed"' in line or '"status":"completed"' in line for line in logs['signaling']) >= 2, 'Duplicate SDK event returns the committed receipt')
+        captured = json.loads((output_dir / 'event.json').read_text())
+        await send(a, 'objective_completed', {**captured, 'event_id': str(uuid.uuid4())})
+        await wait(lambda: any(m.get('event') == 'gameplay.ack' and m['payload']['status'] == 'rejected' for m in am), 'Player-submitted completion rejected')
+        await asyncio.sleep(1)
+        await send(a, 'leaveGame')
+        await wait(lambda: lifecycle(am, 'ENDED') and has('sdk', 'neutralization succeeded outputs='), 'Session ends; Robot neutralized and released')
+        await wait(lambda: has('sdk', 'delayed Controller events emitted') and sum('status: "rejected"' in line or '"status":"rejected"' in line for line in logs['signaling']) >= 3, 'Duplicate and fresh delayed Controller events rejected')
+        await wait(lambda: lifecycle(bm, 'ALLOCATED'), 'Neutralized Robot is reusable by queued player')
+        await send(b, 'leaveGame')
+        async with asyncio.timeout(10):
+            while True:
+                async with browser.get(base + f'/api/player-sessions/{session_id}/gameplay-result') as response:
+                    response.raise_for_status()
+                    result = await response.json()
+                if result['ended_at']:
+                    break
+                await asyncio.sleep(.1)
+        assert len(result['objectives']) == 1 and result['objectives'][0] == receipt
+        async with browser.post(base + f'/api/player-sessions/{session_id}/fuel-settlements', json={'idempotency_key': f'gameplay-verification:{session_id}', 'amount': 1}) as response:
+            response.raise_for_status()
+            fuel = await response.json()
+        assert fuel['applied_amount'] == 1 and fuel['balance'] == 99
+        evidence = json.loads(await php("$s = App\\Models\\PlayerSession::findOrFail($argv[1]); echo json_encode(['session' => $s, 'inventory' => $s->user->inventory, 'events' => App\\Models\\GameplayEvent::where('player_session_id', $s->id)->count(), 'rewards' => App\\Models\\EconomyTransaction::where('player_session_id', $s->id)->where('reason', 'gameplay_objective_completed')->count(), 'fuel_settlements' => App\\Models\\EconomyTransaction::where('player_session_id', $s->id)->where('resource', 'fuel')->count()]);", session_id))
+        assert evidence['session']['user_id'] == user_id
+        assert str(evidence['session']['robot_id']) == simulated['robot_id']
+        assert evidence['session']['started_at'] and evidence['session']['ended_at']
+        assert evidence['inventory']['gold'] == 25 and evidence['inventory']['fuel'] == 99
+        assert evidence['events'] == evidence['rewards'] == evidence['fuel_settlements'] == 1
+        checks.append('One persisted mission result, one gold ledger credit, and one fuel settlement')
+        (output_dir / 'result.json').write_text(json.dumps({'status': 'passed', 'checks': checks, 'receipt': receipt, 'fuel': fuel, 'evidence': evidence}, indent=2))
+        print(f'PASS; evidence: {output_dir}', flush=True)
     finally:
-        for client in clients:
-            if client.connected:
-                await client.disconnect()
-        for process in reversed(processes):
-            if process.returncode is None:
-                process.terminate()
+        for c in clients:
+            if c.connected:
+                await c.disconnect()
+        for p in reversed(processes):
+            if p.returncode is None:
+                p.terminate()
                 try:
-                    await asyncio.wait_for(process.wait(), 5)
+                    await asyncio.wait_for(p.wait(), 5)
                 except asyncio.TimeoutError:
-                    process.kill()
-                    await process.wait()
+                    p.kill()
+                    await p.wait()
         await asyncio.gather(*readers)
-        await desired(original_desired)
+        for browser in browsers:
+            await browser.close()
+        if fixture:
+            await php("$f = json_decode($argv[2], true); App\\Models\\Game::findOrFail($argv[1])->update($f['game']); foreach ($f['robots'] as $r) App\\Models\\Robot::findOrFail($r['id'])->update(['enabled' => $r['enabled'], 'custom' => $r['custom']]);", config['game_id'], json.dumps(fixture))
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--port", type=int, default=3001)
-    parser.add_argument("--output-dir", type=Path, default=Path(tempfile.mkdtemp(prefix="groundbreaking-simulated-")))
+    parser.add_argument('--port', type=int, default=3001)
+    parser.add_argument('--output-dir', type=Path, default=Path(tempfile.mkdtemp(prefix='groundbreaking-gameplay-')))
     args = parser.parse_args()
     asyncio.run(verify(args.port, args.output_dir.resolve()))
