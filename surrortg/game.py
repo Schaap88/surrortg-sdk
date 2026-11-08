@@ -318,42 +318,15 @@ class Game:
         asyncio.run(self._main())
 
     def _post_run(self):
-        # get still existing tasks
-        tasks = asyncio.all_tasks(loop=self._loop)
-        if len(tasks) > 0:
-            logging.info(
-                f"{len(tasks)} asyncio tasks running on Game loop, "
-                "sending cancel"
-            )
-            # cancel existing tasks
-            for task in tasks:
-                task.cancel()
-
-            # wait for the tasks to end
-            self._loop.run_until_complete(asyncio.gather(*tasks))
-
+        # asyncio.run() owns and closes the event loop in _run().
         logging.info("Game ended.\n")
 
     async def _main(self):
-        # get ready to handle GE messages
         self._handler_lock = asyncio.Lock()
-
-        # Allow self.io.register_inputs usage and initialize the game.
-        # Then forbid all later self.io.register_inputs calls.
-        self.io._can_register_inputs = True
-        self.io._can_register_configs = True
-        await self.on_init()
-        self.io._can_register_inputs = False
-        self.io._can_register_configs = False
-
-        # play the game until interrupted, terminated or crashed
-        self._main_task = asyncio.create_task(self.io._socket_handler.run())
-        self._management_task = asyncio.create_task(
-            self.io.management_server.run()
-        )
-
-        # add signal handlers
         self._loop = asyncio.get_running_loop()
+        self._lifecycle_task = asyncio.current_task()
+        self._main_task = self._lifecycle_task
+        tasks = []
         self._loop.add_signal_handler(
             SIGINT, functools.partial(self._exit_signal_handler, 1)
         )
@@ -363,21 +336,56 @@ class Game:
         self._loop.add_signal_handler(SIGUSR1, self._request_update)
 
         try:
+            self.io._can_register_inputs = True
+            self.io._can_register_configs = True
+            try:
+                await self.on_init()
+            finally:
+                self.io._can_register_inputs = False
+                self.io._can_register_configs = False
+
+            self._main_task = asyncio.create_task(
+                self.io._socket_handler.run()
+            )
+            self._management_task = asyncio.create_task(
+                self.io.management_server.run()
+            )
+            tasks = [self._main_task, self._management_task]
             done, pending = await asyncio.wait(
-                [self._main_task, self._management_task],
-                return_when=asyncio.FIRST_COMPLETED,
+                tasks, return_when=asyncio.FIRST_COMPLETED
             )
             for task in done:
                 await task
         except asyncio.CancelledError:
-            # if asyncio.CancelledError --> was ended on purpose
-            await self._exit_correctly()
+            if self._exit_reason not in (1, 2, 3):
+                raise
         except Exception as e:
-            # else _main_task did not end on purpose --> Python has crashed
             self._exit_reason = 0
             self._exception = e
-            await self._exit_correctly()
-            raise  # after exiting correctly, raise the original exception
+            raise
+        finally:
+            try:
+                await self._exit_correctly()
+            finally:
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                for result in results:
+                    if (
+                        isinstance(result, Exception)
+                        and result is not self._exception
+                    ):
+                        logging.error(
+                            "SDK task failed during shutdown",
+                            exc_info=(
+                                type(result),
+                                result,
+                                result.__traceback__,
+                            ),
+                        )
+                for sig in (SIGINT, SIGTERM, SIGUSR1):
+                    self._loop.remove_signal_handler(sig)
 
     def _request_update(self):
         logging.info("Update request received")
@@ -386,7 +394,7 @@ class Game:
     def _exit_signal_handler(self, exit_reason):
         self._exit_reason = exit_reason
         self._exception = None
-        self._main_task.cancel()
+        self._lifecycle_task.cancel()
 
     async def _exit_correctly(self):
         logging.info("Game ending...")
@@ -397,6 +405,10 @@ class Game:
         ):
             logging.info("Cancelling previous GE task due to program exit")
             self._current_ge_task.cancel()
+            try:
+                await self._current_ge_task
+            except asyncio.CancelledError:
+                pass
 
         # log the exit reason
         logging.info(
@@ -406,13 +418,19 @@ class Game:
             logging.info(f"\tException name: {type(self._exception).__name__}")
 
         # wait for on_exit to finish
-        await self.on_exit(self._exit_reason, self._exception)
-        await self.io.shutdown_inputs()
-        await self.io.controller_runtime.shutdown()
-
-        # shut down connections
-        await self.io._socket_handler.shutdown()
-        await self.io.management_server.close()
+        try:
+            await self.on_exit(self._exit_reason, self._exception)
+        finally:
+            try:
+                await self.io.shutdown_inputs()
+            finally:
+                try:
+                    await self.io.controller_runtime.shutdown()
+                finally:
+                    try:
+                        await self.io._socket_handler.shutdown()
+                    finally:
+                        await self.io.management_server.close()
 
         # run() should now move to _post_run()
 

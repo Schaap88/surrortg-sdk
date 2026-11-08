@@ -172,9 +172,29 @@ class SocketioNamespace(socketio.AsyncClientNamespace):
             )
 
     async def run(self):
-        while not self._shutdown:
-            await self._connect()
-            await self.sio.wait()
+        wait_task = None
+        try:
+            while not self._shutdown:
+                await self._connect()
+                if self._shutdown:
+                    break
+                # Cancelling wait() would also cancel Engine.IO's read loop.
+                # Keep it alive until disconnect has closed the transport.
+                wait_task = asyncio.create_task(self.sio.wait())
+                await asyncio.shield(wait_task)
+                await self._close_client()
+        finally:
+            try:
+                await self.shutdown()
+            finally:
+                if wait_task is not None:
+                    if not wait_task.done():
+                        wait_task.cancel()
+                    try:
+                        await wait_task
+                    except asyncio.CancelledError:
+                        if not wait_task.cancelled():
+                            raise
 
     async def _connect(self):
         logging.info("socketio: connecting...")
@@ -194,7 +214,9 @@ class SocketioNamespace(socketio.AsyncClientNamespace):
                 def connect_error(msg):
                     # Admission errors are category-only. Never interpolate
                     # handshake data or a library diagnostic that may echo it.
-                    category = msg.get("category") if isinstance(msg, dict) else None
+                    category = (
+                        msg.get("category") if isinstance(msg, dict) else None
+                    )
                     logging.error(
                         "GE socketio connection rejected: %s",
                         category or "connection_error",
@@ -217,8 +239,10 @@ class SocketioNamespace(socketio.AsyncClientNamespace):
                 )
                 return
             except asyncio.CancelledError:
+                await self._close_client()
                 raise
             except Exception as e:
+                await self._close_client()
                 if type(e) == asyncio.TimeoutError:
                     logging.info(
                         f"socketio: {SOCKETIO_NAMESPACE} did not connect"
@@ -244,9 +268,19 @@ class SocketioNamespace(socketio.AsyncClientNamespace):
     async def shutdown(self):
         logging.info("socketio shutting down...")
         self._shutdown = True
-        if self.sio is not None:
-            await self.disconnect()
-            await self.sio.disconnect()
+        await self._close_client()
+
+    async def _close_client(self):
+        client, self.sio = self.sio, None
+        if client is None:
+            return
+        try:
+            # Also stops Socket.IO's automatic reconnection task.
+            await client.shutdown()
+        finally:
+            # shutdown() does nothing for a partially connected client.
+            # Engine.IO disconnect also closes its owned HTTP session.
+            await client.eio.disconnect()
 
 
 class LocalSocketHandler:
@@ -438,7 +472,10 @@ class SocketHandler:
 
             for task in pending:
                 task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for result in results:
+                if isinstance(result, Exception):
+                    raise result
 
             for task in done:
                 exc = task.exception()
@@ -448,16 +485,17 @@ class SocketHandler:
             for task in tasks:
                 if not task.done():
                     task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for result in results:
+                if isinstance(result, Exception):
+                    raise result
             raise
         finally:
             for task in list(self._run_tasks):
                 if not task.done():
                     task.cancel()
             if self._run_tasks:
-                await asyncio.gather(
-                    *self._run_tasks, return_exceptions=True
-                )
+                await asyncio.gather(*self._run_tasks, return_exceptions=True)
             self._run_tasks = []
 
     async def _handle_message(self, msg):
@@ -552,13 +590,19 @@ class SocketHandler:
         for task in list(self._run_tasks):
             if not task.done():
                 task.cancel()
-        if self._run_tasks:
-            await asyncio.gather(*self._run_tasks, return_exceptions=True)
+        results = await asyncio.gather(
+            *self._run_tasks, return_exceptions=True
+        )
         self._run_tasks = []
 
-        await self.socketio_namespace.shutdown()
-        if self.local_socket_handler is not None:
-            self.local_socket_handler.shutdown()
+        try:
+            await self.socketio_namespace.shutdown()
+        finally:
+            if self.local_socket_handler is not None:
+                self.local_socket_handler.shutdown()
+        for result in results:
+            if isinstance(result, Exception):
+                raise result
         logging.info("SocketHandler shut down gracefully")
 
     async def reconnect(self):
