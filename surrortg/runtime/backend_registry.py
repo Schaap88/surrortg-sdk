@@ -1,3 +1,5 @@
+import os
+
 from .backend import Backend, TcpRobotBackend
 from .simulated_backend import SimulatedRobotBackend
 
@@ -8,6 +10,8 @@ class BackendRegistry:
         self.simulated_world = simulated_world
 
     def create(self, robot: dict) -> Backend:
+        if os.environ.get('SIMULATED_ONLY') == 'true' and robot.get('implementation_kind') != 'simulated':
+            raise ValueError('Simulation-only mode refuses non-simulated backends')
         backend = self._factory(robot)
         if isinstance(backend, SimulatedRobotBackend) and self.simulated_world:
             backend.world = self.simulated_world
