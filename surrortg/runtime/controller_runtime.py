@@ -248,11 +248,22 @@ class ControllerRuntime:
 
     async def shutdown(self):
         """Fail safe and release all configured backends on orderly exit."""
-        if self._gameplay_task:
-            self._gameplay_task.cancel()
-        await self._neutralize_seats(tuple(self.seats))
-        for robot in self.robots.values():
-            await robot["backend"].stop()
+        tasks = [
+            task
+            for task in (self._gameplay_task, self._telemetry_task)
+            if task is not None
+        ]
+        for task in tasks:
+            task.cancel()
+        try:
+            await self._neutralize_seats(tuple(self.seats))
+            for robot in self.robots.values():
+                await robot["backend"].stop()
+        finally:
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for result in results:
+                if isinstance(result, Exception):
+                    raise result
 
     async def _neutralize_seats(self, seats):
         for seat in set(seats):
