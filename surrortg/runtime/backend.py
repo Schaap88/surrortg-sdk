@@ -87,7 +87,7 @@ class TcpRobotBackend(Backend):
         connect_timeout=5,
         response_timeout=2,
         heartbeat_interval=2,
-        telemetry_interval=10,
+        telemetry_interval=1,
         reconnect_initial=0.1,
         reconnect_max=5,
     ):
@@ -125,6 +125,12 @@ class TcpRobotBackend(Backend):
 
     async def apply_configuration(self, runtime_config: dict) -> None:
         await super().apply_configuration(runtime_config)
+        if "telemetry_interval" in runtime_config:
+            interval = runtime_config["telemetry_interval"]
+            if (isinstance(interval, bool) or not isinstance(interval, (int, float))
+                    or not math.isfinite(interval) or interval <= 0):
+                raise ValueError("telemetry_interval must be finite and positive")
+            self._telemetry_interval = interval
         self.address = runtime_config.get("address")
         if not isinstance(self.address, str) or not self.address:
             raise ValueError("TCP Robot requires runtime_config.address")

@@ -16,6 +16,7 @@ class SimulatedWorld:
         self.game_id = str(game_id) if game_id is not None else None
         self.publish = publish
         self.robots = {}
+        self._owners = {}
         self.sequence = 0
         self._task = None
         self._last_tick = None
@@ -24,7 +25,8 @@ class SimulatedWorld:
         self.game_id = str(game_id)
         self.publish = publish
 
-    def add(self, robot_id, seat):
+    def add(self, robot_id, seat, owner=None):
+        self._owners[str(robot_id)] = owner
         index = len(self.robots)
         columns = 4
         self.robots[str(robot_id)] = {
@@ -36,10 +38,15 @@ class SimulatedWorld:
             self._last_tick = time.monotonic()
             self._task = asyncio.create_task(self._run())
 
-    def remove(self, robot_id):
+    def remove(self, robot_id, owner=None):
+        if owner is not None and self._owners.get(str(robot_id)) is not owner:
+            return
         self.robots.pop(str(robot_id), None)
+        self._owners.pop(str(robot_id), None)
 
-    def control(self, robot_id, command):
+    def control(self, robot_id, command, owner=None):
+        if owner is not None and self._owners.get(str(robot_id)) is not owner:
+            return
         robot = self.robots.get(str(robot_id))
         if not robot:
             return
@@ -51,10 +58,28 @@ class SimulatedWorld:
             key = command.get("id", "").lower()
             robot["steering" if any(part in key for part in ("steer", "turn", "x")) else "drive"] = float(values["val"])
 
-    def neutralize(self, robot_id):
+    def neutralize(self, robot_id, owner=None):
+        if owner is not None and self._owners.get(str(robot_id)) is not owner:
+            return
         robot = self.robots.get(str(robot_id))
         if robot:
             robot["drive"] = robot["steering"] = 0.0
+
+    def is_pinned(self, robot_id):
+        robot = self.robots.get(str(robot_id))
+        if not robot or not robot["drive"]:
+            return False
+        dx = math.cos(robot["heading"]) * robot["drive"]
+        dy = math.sin(robot["heading"]) * robot["drive"]
+        return ((robot["x"] <= 0 and dx < -1e-9) or
+                (robot["x"] >= self.WIDTH and dx > 1e-9) or
+                (robot["y"] <= 0 and dy < -1e-9) or
+                (robot["y"] >= self.HEIGHT and dy > 1e-9))
+
+    def is_moving(self, robot_id):
+        robot = self.robots.get(str(robot_id))
+        return bool(robot and (robot["steering"] or
+                              (robot["drive"] and not self.is_pinned(robot_id))))
 
     async def _run(self):
         try:

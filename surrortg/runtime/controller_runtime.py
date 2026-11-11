@@ -2,7 +2,9 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
 import os
+import re
 import time
 import uuid
 from datetime import datetime, timezone
@@ -52,6 +54,10 @@ class ControllerRuntime:
         self._gameplay_pending = {}
         self._gameplay_task = None
         self._development_completed = set()
+        self.stations = []
+        self._station_task = None
+        self._station_sequences = {}
+        self._station_totals = {}
 
     async def _emit_world_snapshot(self, snapshot):
         await self._emit("simulation.world_snapshot", snapshot)
@@ -244,13 +250,15 @@ class ControllerRuntime:
         self._development_completed.clear()
         self._enabled_seats.clear()
         self.connection_epoch = None
+        if self._station_task:
+            self._station_task.cancel()
         self._telemetry_pending.clear()
 
     async def shutdown(self):
         """Fail safe and release all configured backends on orderly exit."""
         tasks = [
             task
-            for task in (self._gameplay_task, self._telemetry_task)
+            for task in (self._gameplay_task, self._telemetry_task, self._station_task)
             if task is not None
         ]
         for task in tasks:
@@ -346,6 +354,11 @@ class ControllerRuntime:
             })
             return False
 
+        if self._station_task:
+            self._station_task.cancel()
+            await asyncio.gather(self._station_task, return_exceptions=True)
+            self._station_task = None
+
         for candidate in candidates.values():
             try:
                 await candidate["backend"].start()
@@ -371,6 +384,7 @@ class ControllerRuntime:
         self.connection_epoch = command["connection_epoch"]
         self.applied_config_revision = command["config_revision"]
         self.applied_config_digest = command["config_digest"]
+        self.stations = [dict(station) for station in config.get("stations", [])]
         self._last_operation = operation
         self._observations = {robot_id: {"seq": 0, "reachable": False, "ready": False, "faults": {}} for robot_id in candidates}
         initial_statuses = {}
@@ -402,7 +416,49 @@ class ControllerRuntime:
         await self.emit_snapshot()
         for robot_id, observation in self._observations.items():
             logging.info("runtime > Robot %s reachable=%s ready=%s", robot_id, observation["reachable"], observation["ready"])
+        if any(robot["implementation_kind"] == "simulated" for robot in candidates.values()):
+            stations = [station for station in self.stations
+                        if station["simulated"] and station["module"] == "mass_flow"]
+            if stations:
+                self._station_task = asyncio.create_task(self._emit_stations(stations))
         return True
+
+    async def _emit_stations(self, stations):
+        # One owned task: cancellation also cancels an in-flight transport emit.
+        rates = {station["key"]: 0.0 for station in stations}
+        totals = self._station_totals.setdefault(self.game_id, {})
+        for station in stations:
+            totals.setdefault(station["key"], 0.0)
+        last_sample = time.monotonic()
+        while self.connection_epoch is not None:
+            await asyncio.sleep(1)
+            now = time.monotonic()
+            dt, last_sample = now - last_sample, now
+            moving = any(
+                robot["implementation_kind"] == "simulated" and
+                self.simulated_world.is_moving(robot_id)
+                for robot_id, robot in self.robots.items()
+            )
+            for station in stations:
+                key, maximum = station["key"], station["max_rate_g_per_s"]
+                previous = rates[key]
+                target = min(maximum, 2**31 - 1) if moving else 0.0
+                # Exponential easing stays within full scale, even after delays.
+                rates[key] += (target - rates[key]) * (1 - math.exp(-dt / 3))
+                totals[key] = min(2**31 - 1, totals[key] + (previous + rates[key]) * dt / 2)
+                seq = self._station_sequences.get(key, 0) + 1
+                self._station_sequences[key] = seq
+                try:
+                    await self._emit("station.observation", {
+                        "schema_version": 1, "game_id": self.game_id,
+                        "controller_id": self.controller_id,
+                        "connection_epoch": self.connection_epoch,
+                        "config_revision": self.applied_config_revision,
+                        "station_key": key, "seq": seq, "observed_at": self._clock(),
+                        "mass_flow": {"rate_g_per_s": rates[key], "total_g": totals[key]},
+                    })
+                except Exception as error:
+                    logging.warning("runtime > Station emit failed: %s", type(error).__name__)
 
     def _queue_telemetry(self, robot_id, value):
         """Coalesce observations per Robot without blocking control handling."""
@@ -523,6 +579,20 @@ class ControllerRuntime:
             if robot.get("implementation_kind") not in ("physical", "simulated") or not isinstance(robot.get("runtime_config"), dict):
                 raise RuntimeConfigurationError("Invalid Robot runtime configuration")
             ids.add(robot_id); seats.add(seat)
+        stations = config.get("stations", [])
+        if not isinstance(stations, list):
+            raise RuntimeConfigurationError("stations must be a list")
+        keys = set()
+        for station in stations:
+            if not isinstance(station, dict):
+                raise RuntimeConfigurationError("Invalid station configuration")
+            key, maximum = station.get("key"), station.get("max_rate_g_per_s")
+            if (not isinstance(key, str) or not re.fullmatch(r"[a-z][a-z0-9-]{0,31}", key)
+                    or key in keys or station.get("module") != "mass_flow"
+                    or not isinstance(station.get("simulated"), bool)
+                    or isinstance(maximum, bool) or not isinstance(maximum, int) or maximum <= 0):
+                raise RuntimeConfigurationError("Invalid or duplicate station configuration")
+            keys.add(key)
         return config
 
     def _install_status(self, robot_id, status):
