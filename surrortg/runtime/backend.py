@@ -152,7 +152,7 @@ class TcpRobotBackend(Backend):
             except asyncio.CancelledError:
                 pass
         if self._endpoint is not None and self._status.ready:
-            await self.neutralize()
+            await self.neutralize(reason="backend_stop")
         await self._close_endpoint()
         self._endpoint = None
         await self._set_status(False, False)
@@ -196,10 +196,18 @@ class TcpRobotBackend(Backend):
             return False
         return await self._write(b"".join(frames))
 
-    async def neutralize(self) -> str:
+    async def neutralize(self, *, reason="direct", request_id=None) -> str:
         if self._endpoint is None or not self._status.ready:
-            return "rejected"
-        return "succeeded" if await self._write(self.STOP) else "failed"
+            result = "rejected"
+        else:
+            result = "succeeded" if await self._write(self.STOP) else "failed"
+        # Keep diagnostics after the STOP write, including formatting/redaction.
+        logging.info(
+            "runtime > Robot %s seat=%s neutralization %s reason=%s request_id=%s",
+            self.robot_id, self.seat, result,
+            self._diagnostic_text(reason), self._diagnostic_text(request_id),
+        )
+        return result
 
     async def _connect_and_validate(self):
         try:
@@ -394,7 +402,11 @@ class TcpRobotBackend(Backend):
     @staticmethod
     def _exception_diagnostic(error):
         """Return bounded error detail without common credential forms."""
-        message = " ".join(str(error).split()) or "no detail"
+        return f"{type(error).__name__}: {TcpRobotBackend._diagnostic_text(error)}"
+
+    @staticmethod
+    def _diagnostic_text(value):
+        message = " ".join(str(value).split()) or "no detail"
         message = re.sub(
             r"(?i)\b(password|token|secret|credential)\s*[=:]\s*\S+",
             r"\1=<redacted>",
@@ -405,7 +417,7 @@ class TcpRobotBackend(Backend):
             r"\1<redacted>@",
             message,
         )
-        return f"{type(error).__name__}: {message[:300]}"
+        return message[:300]
 
     @classmethod
     def _frame(cls, command_id, value, multiplier):

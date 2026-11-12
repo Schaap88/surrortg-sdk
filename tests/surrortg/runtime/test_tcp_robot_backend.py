@@ -5,7 +5,7 @@ import unittest
 from unittest.mock import AsyncMock, patch
 
 from surrortg.network.socket_handler import Message
-from surrortg.runtime import BackendRegistry, ControllerRuntime, TcpRobotBackend
+from surrortg.runtime import BackendRegistry, BackendStatus, ControllerRuntime, TcpRobotBackend
 
 from .test_controller_runtime import configure_command, neutralize_command
 
@@ -123,6 +123,47 @@ async def eventually(predicate, timeout=0.5):
 
 
 class TcpRobotBackendTest(unittest.IsolatedAsyncioTestCase):
+    async def test_neutralization_logs_result_and_reason_after_stop_write(self):
+        for result in ("succeeded", "failed", "rejected"):
+            with self.subTest(result=result):
+                backend = TcpRobotBackend("10", 2)
+                endpoint = unittest.mock.Mock()
+                endpoint.send = AsyncMock(return_value=result == "succeeded")
+                endpoint.close = AsyncMock()
+                backend._endpoint = endpoint
+                backend._status = BackendStatus(
+                    reachable=True, ready=result != "rejected"
+                )
+
+                def logged(*args):
+                    if result == "rejected":
+                        endpoint.send.assert_not_awaited()
+                    else:
+                        endpoint.send.assert_awaited_once_with(backend.STOP)
+
+                with patch("logging.info", side_effect=logged) as log:
+                    self.assertEqual(await backend.neutralize(
+                        reason="shutdown", request_id="stop-10"
+                    ), result)
+                log.assert_called_once_with(
+                    "runtime > Robot %s seat=%s neutralization %s reason=%s request_id=%s",
+                    "10", 2, result, "shutdown", "stop-10",
+                )
+                if result == "failed":
+                    self.assertFalse(backend._status.ready)
+                    endpoint.close.assert_awaited_once()
+
+    async def test_neutralization_context_is_single_line_and_redacted(self):
+        backend = TcpRobotBackend("10", 2)
+        with self.assertLogs(level="INFO") as logs:
+            await backend.neutralize(
+                reason="command\n token=private", request_id="secret=private"
+            )
+        self.assertEqual(len(logs.output), 1)
+        self.assertNotIn("\n", logs.output[0])
+        self.assertNotIn("private", logs.output[0])
+        self.assertIn("neutralization rejected reason=command token=<redacted>", logs.output[0])
+
     def test_full_scale_throttle_rounds_joystick_edge_to_protocol_edges(self):
         self.assertEqual(TcpRobotBackend._frame(1, 1.0, "throttle"), b"\x01\xc8")
         self.assertEqual(TcpRobotBackend._frame(1, 0.9999, "throttle"), b"\x01\xc8")
@@ -415,6 +456,45 @@ class TcpRobotBackendTest(unittest.IsolatedAsyncioTestCase):
             await runtime.shutdown()
             self.assertFalse(created[1]._running)
             self.assertGreaterEqual(server.frames.count(b"\xff\x00"), 5)
+
+    async def test_runtime_propagates_stop_triggers_and_command_correlation(self):
+        endpoint = unittest.mock.Mock()
+        endpoint.send = AsyncMock(return_value=True)
+        endpoint.close = AsyncMock()
+        backend = TcpRobotBackend("417", 1)
+        backend._endpoint = endpoint
+        backend._status = BackendStatus(reachable=True, ready=True)
+        runtime = ControllerRuntime("controller-a", AsyncMock())
+        runtime.robots = {"417": {"backend": backend}}
+        runtime.seats = {1: "417"}
+        config = configure_command()
+        runtime.game_id = "12"
+        runtime.connection_epoch = config["connection_epoch"]
+        runtime.applied_config_revision = config["config_revision"]
+        with self.assertLogs(level="INFO") as logs:
+            await runtime.neutralize(neutralize_command())
+            # Cached commands emit their result without another STOP/log attempt.
+            await runtime.neutralize(neutralize_command())
+            await runtime.handle_message(Message(
+                "disableRouting", "controller-a", src="gameEngine", payload={"seat": 1}
+            ))
+            runtime._peers["player"] = 1
+            await runtime.handle_message(Message(
+                "peerLeft", "controller-a", src="gameEngine", payload={"id": "player"}
+            ))
+            runtime.disconnect()
+            await asyncio.sleep(0)
+            await runtime.shutdown()
+        lines = [record.getMessage() for record in logs.records]
+        self.assertEqual(len(lines), 6)
+        for line, reason in zip(lines, (
+            "neutralization_command:allocation_released", "routing_disabled",
+            "peer_left", "signaling_disconnect", "shutdown", "backend_stop",
+        )):
+            self.assertIn(f"Robot 417 seat=1 neutralization succeeded reason={reason}", line)
+        self.assertIn("request_id=neutralize-1", lines[0])
+        self.assertEqual(endpoint.send.await_count, 6)
+        self.assertTrue(all(call.args == (backend.STOP,) for call in endpoint.send.await_args_list))
 
 
 class FailedEndpoint:

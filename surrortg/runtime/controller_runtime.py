@@ -9,7 +9,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 
-from .backend import BackendStatus
+from .backend import BackendStatus, TcpRobotBackend
 from .backend_registry import BackendRegistry
 from .simulated_world import SimulatedWorld
 
@@ -115,13 +115,13 @@ class ControllerRuntime:
                 binding = self._gameplay_bindings.pop(seat, None)
                 if binding:
                     self._development_completed.discard(binding['session_id'])
-                await self._neutralize_seats((seat,))
+                await self._neutralize_seats((seat,), reason="peer_left")
         elif message.event == "enableRouting":
             self._enabled_seats.update([payload["seat"]] if "seat" in payload else self.seats)
         elif message.event == "disableRouting":
             seats = [payload["seat"]] if "seat" in payload else list(self.seats)
             self._enabled_seats.difference_update(seats)
-            await self._neutralize_seats(seats)
+            await self._neutralize_seats(seats, reason="routing_disabled")
         return True
 
     def objective_completed(self, seat, objective_key):
@@ -205,7 +205,11 @@ class ControllerRuntime:
         status = "rejected"
         if self._valid_neutralization(command):
             try:
-                status = await self.robots[str(command["robot_id"])]["backend"].neutralize()
+                status = await self._neutralize_backend(
+                    self.robots[str(command["robot_id"])]["backend"],
+                    reason=f"neutralization_command:{command['reason']}",
+                    request_id=request_id,
+                )
                 if status not in NEUTRALIZATION_STATUSES:
                     status = "unsupported"
             except Exception:
@@ -237,7 +241,7 @@ class ControllerRuntime:
         """Invalidate transport-scoped positive observations."""
         try:
             asyncio.get_running_loop().create_task(
-                self._neutralize_seats(tuple(self.seats))
+                self._neutralize_seats(tuple(self.seats), reason="signaling_disconnect")
             )
         except RuntimeError:
             pass
@@ -264,7 +268,7 @@ class ControllerRuntime:
         for task in tasks:
             task.cancel()
         try:
-            await self._neutralize_seats(tuple(self.seats))
+            await self._neutralize_seats(tuple(self.seats), reason="shutdown")
             for robot in self.robots.values():
                 await robot["backend"].stop()
         finally:
@@ -273,13 +277,22 @@ class ControllerRuntime:
                 if isinstance(result, Exception):
                     raise result
 
-    async def _neutralize_seats(self, seats):
+    @staticmethod
+    async def _neutralize_backend(backend, *, reason, request_id=None):
+        # Diagnostic context is TCP-specific; preserve other backends' contract.
+        if isinstance(backend, TcpRobotBackend):
+            return await backend.neutralize(reason=reason, request_id=request_id)
+        return await backend.neutralize()
+
+    async def _neutralize_seats(self, seats, *, reason="direct"):
         for seat in set(seats):
             robot_id = self.robot_id_for_seat(seat)
             if robot_id is None:
                 continue
             try:
-                await self.robots[robot_id]["backend"].neutralize()
+                await self._neutralize_backend(
+                    self.robots[robot_id]["backend"], reason=reason
+                )
             except Exception:
                 logging.exception(
                     "runtime > Robot %s neutralization attempt failed", robot_id
